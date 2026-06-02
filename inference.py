@@ -25,7 +25,6 @@ from utils.conversion import depth2xyz
 from utils.logger import get_logger
 from utils.misc import tensor2np_d, tensor2np
 from evaluation.accuracy import show_grad
-from models.lgt_net import LGT_Net
 from utils.writer import xyz2json
 from visualization.boundary import draw_boundaries
 from visualization.floorplan import draw_floorplan, draw_iou_floorplan
