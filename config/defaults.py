@@ -4,6 +4,7 @@
 """
 import os
 import logging
+import datetime
 from yacs.config import CfgNode as CN
 
 _C = CN()
@@ -43,6 +44,8 @@ _C.TRAIN.MIN_LR = 5e-6
 _C.TRAIN.CLIP_GRAD = 5.0
 # Auto resume from latest checkpoint
 _C.TRAIN.RESUME_LAST = True
+# Whether to load checkpoint weights when training
+_C.TRAIN.LOAD_CKPT = True
 # Gradient accumulation steps
 # could be overwritten by command line argument
 _C.TRAIN.ACCUMULATION_STEPS = 0
@@ -264,6 +267,23 @@ def get_config(args=None):
         if 'bs' in args and args.bs:
             config.DATA.BATCH_SIZE = args.bs
 
+        if 'epochs' in args and args.epochs:
+            config.TRAIN.EPOCHS = args.epochs
+
+        if 'for_test_index' in args and args.for_test_index:
+            config.DATA.FOR_TEST_INDEX = args.for_test_index
+
+        if 'device' in args and args.device:
+            config.TRAIN.DEVICE = args.device
+
+        if 'smoke_test' in args and args.smoke_test:
+            config.DATA.BATCH_SIZE = 1
+            config.DATA.FOR_TEST_INDEX = 1
+            config.TRAIN.EPOCHS = 1
+
+        if 'no_ckpt' in args and args.no_ckpt:
+            config.TRAIN.LOAD_CKPT = False
+
         if 'save_eval' in args and args.save_eval:
             config.SAVE_EVAL = True
 
@@ -294,11 +314,14 @@ def get_config(args=None):
         if 'ckpt_option' in args and args.ckpt_option:
             config.EVAL.CKPT_OPTION = args.ckpt_option    
 
-    args = config.MODEL.ARGS[0]
+    model_args = config.MODEL.ARGS[0]
     # config.CKPT.DIR = os.path.join(config.CKPT.ROOT, f"{args['decoder_name']}_{args['output_name']}_Net",
     #                                config.TAG, 'debug' if config.DEBUG else '')
-    config.CKPT.DIR = os.path.join(config.CKPT.ROOT, f"{args['output_name']}_Net",
+    config.CKPT.DIR = os.path.join(config.CKPT.ROOT, f"{model_args['output_name']}_Net",
                                    config.TAG, 'debug' if config.DEBUG else '')
+    if args and 'smoke_test' in args and args.smoke_test:
+        timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+        config.CKPT.DIR = os.path.join(config.CKPT.DIR, 'smoke_test', timestamp)
     config.CKPT.RESULT_DIR = os.path.join(config.CKPT.DIR, 'results', config.MODE+'_'+config.EVAL.CKPT_OPTION)
     # config.CKPT.RESULT_DIR = os.path.join(config.CKPT.DIR, 'results', config.MODE+"_large_sub")
     config.LOGGER.DIR = os.path.join(config.CKPT.DIR, "logs")

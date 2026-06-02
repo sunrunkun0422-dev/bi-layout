@@ -1,6 +1,24 @@
 """
 @Date: 2021/07/17
-@description:
+@description: 全景图布局识别系统主训练脚本
+@author:
+@workflow:
+  【全景图布局识别完整流程】
+  STEP 1: 输入全景图(512x1024 RGB)
+       ↓
+  STEP 2: 特征提取(ResNet50 Backbone) → (B, 1024, 256)
+       ↓
+  STEP 3: 双分支Transformer处理
+       ├─ STEP 3.1: Origin Head → 预测边界深度 depth(B,256) + 天花板比例 ratio(B,1)
+       ├─ STEP 3.2: New Head → 预测遮挡感知深度 new_depth(B,256)
+       ↓
+  STEP 4: 多目标损失加权融合
+       ├─ 主损失: L1Loss(predicted_depth vs gt_depth)
+       ├─ 辅助损失: GradLoss(梯度匹配) + OpeningLoss(门窗损失)
+       ↓
+  STEP 5: 后处理(Manhattan Constraint) → 规则化布局
+       ↓
+  STEP 6: 输出最终布局(JSON格式 + 3D模型 + 可视化)
 """
 import sys
 import os
@@ -30,8 +48,9 @@ from evaluation.accuracy import calc_accuracy, show_heat_map, calc_ce, calc_pe, 
     show_depth_normal_grad, calc_f1_score, show_opening, calc_ap, calc_tp_fp_fn, precision_recall_curve
 from postprocessing.post_process import post_process
 
-# ambiguity
+# ambiguity 坐标转换函数: 深度图→3D点云、像素坐标转换等
 from utils.conversion import depth2xyz, uv2pixel
+# 边界处理函数: corners坐标→边界多边形转换
 from utils.boundary import corners2boundaries
 
 try:
@@ -41,59 +60,98 @@ except ImportError:
 
 
 def parse_option():
+    """
+    STEP 1.1: 命令行参数解析
+    ================================
+    功能: 解析用户输入的命令行参数，配置系统运行模式
+
+    输入: 命令行参数（如 --cfg, --mode, --post_processing）
+    输出: args对象，包含所有配置参数
+
+    为什么这样设计：
+    - 允许灵活的命令行配置，无需修改代码即可改变运行模式
+    - 支持训练/验证/测试三种模式
+    - 支持多种后处理方法(manhattan/atalanta)
+    """
+    # 判断是否在调试模式运行（vs.code调试器)
     debug = True if sys.gettrace() else False
+
     parser = argparse.ArgumentParser(description='Panorama Layout Transformer training and evaluation script')
+
+    # ===== 配置文件路径 =====
     parser.add_argument('--cfg',
                         type=str,
                         default='/media/Pluto/frank/room_layout_project/src/config/zind.yaml',
                         metavar='FILE',
-                        help='path to config file')
+                        help='path to config file - 指定YAML配置文件路径')
 
+    # ===== 运行模式选择 =====
     parser.add_argument('--mode',
                         type=str,
                         default='train',
                         choices=['train', 'val', 'test'],
-                        help='train/val/test mode')
+                        help='train/val/test mode - 选择运行模式')
 
     parser.add_argument('--val_name',
                         type=str,
                         choices=['val', 'test'],
-                        help='val name')
+                        help='val name - 验证集选择(验证/测试)')
 
+    # ===== 批处理和优化参数 =====
     parser.add_argument('--bs', type=int,
-                        help='batch size')
+                        help='batch size - 批处理大小')
 
+    parser.add_argument('--epochs', type=int,
+                        help='epochs - 训练轮数')
+
+    parser.add_argument('--for_test_index', type=int,
+                        help='for_test_index - 仅使用前N个样本做冒烟测试')
+
+    parser.add_argument('--device', type=str,
+                        help='device - 显式指定训练设备(cpu/cuda:0)')
+
+    parser.add_argument('--smoke_test', action='store_true',
+                        help='smoke_test - 使用最小数据量和最少epoch做快速验证')
+
+    parser.add_argument('--no_ckpt', action='store_true',
+                        help='no_ckpt - 训练时不加载历史检查点')
+
+    # ===== 评估和保存选项 =====
     parser.add_argument('--save_eval', action='store_true',
-                        help='save eval result')
+                        help='save eval result - 是否保存评估结果')
 
+    # ===== 后处理和评估指标 =====
     parser.add_argument('--post_processing', type=str,
                         choices=['manhattan', 'atalanta', 'manhattan_old'],
-                        help='type of postprocessing ')
+                        help='type of postprocessing - 后处理方法选择')
 
     parser.add_argument('--need_cpe', action='store_true',
-                        help='need to evaluate corner error and pixel error')
+                        help='need to evaluate corner error and pixel error - 计算角点/像素误差')
 
     parser.add_argument('--need_f1', action='store_true',
-                        help='need to evaluate f1-score of corners')
+                        help='need to evaluate f1-score of corners - 计算F1分数')
 
     parser.add_argument('--need_rmse', action='store_true',
-                        help='need to evaluate root mean squared error and delta error')
+                        help='need to evaluate root mean squared error and delta error - 计算RMSE')
 
     parser.add_argument('--force_cube', action='store_true',
-                        help='force cube shape when eval')
+                        help='force cube shape when eval - 强制立方体形状评估')
 
+    # ===== 模型结构参数 =====
     parser.add_argument('--wall_num', type=int,
-                        help='wall number')
-    
-    parser.add_argument('--ckpt_option', 
+                        help='wall number - 墙壁数量约束')
+
+    parser.add_argument('--ckpt_option',
                         type=str,
                         default='best',
                         choices=['last', 'best', 'oracle', 'average'],
-                        help='checkpoint options')
+                        help='checkpoint options - 选择加载的检查点类型')
 
-
+    # 解析并返回参数
     args = parser.parse_args()
     args.debug = debug
+
+    # 打印所有参数便于调试
     print("arguments:")
     for arg in vars(args):
         print(arg, ":", getattr(args, arg))
@@ -102,79 +160,189 @@ def parse_option():
 
 
 def main():
-    args = parse_option()
-    config = get_config(args)
+    """
+    STEP 1.2: 主程序入口 - 系统初始化和启动
+    ================================
+    功能: 初始化系统、准备训练环境、启动单/多进程训练
 
+    输入: 无(从parse_option()获取)
+    输出: 无(但会启动main_worker)
+
+    执行流程:
+    1. 解析命令行参数
+    2. 加载配置文件
+    3. 清理旧的检查点(如果重新训练)
+    4. 创建必要的输出目录
+    5. 检查GPU/CUDA可用性
+    6. 启动单进程或多进程训练
+    """
+    # ===== STEP 1.2.1: 参数和配置加载 =====
+    args = parse_option()
+    config = get_config(args)  # 从YAML配置文件加载完整配置
+
+    nprocs = 1
+
+    # ===== STEP 1.2.2: 清理旧检查点(如果从头开始训练) =====
     if config.TRAIN.SCRATCH and os.path.exists(config.CKPT.DIR) and config.MODE == 'train':
         print(f"Train from scratch, delete checkpoint dir: {config.CKPT.DIR}")
+        # 查找所有已保存的检查点文件
         f = [int(f.split('_')[-1].split('.')[0]) for f in os.listdir(config.CKPT.DIR) if 'pkl' in f]
         if len(f) > 0:
+            # 获取最后一个epoch编号
             last_epoch = np.array(f).max()
+            # 如果训练轮数较多,需要用户确认是否删除
             if last_epoch > 10:
                 c = input(f"delete it (last_epoch: {last_epoch})?(Y/N)\n")
                 if c != 'y' and c != 'Y':
                     exit(0)
 
+        # 清除整个检查点目录
         shutil.rmtree(config.CKPT.DIR, ignore_errors=True)
 
-    os.makedirs(config.CKPT.DIR, exist_ok=True)
-    os.makedirs(config.CKPT.RESULT_DIR, exist_ok=True)
-    os.makedirs(config.LOGGER.DIR, exist_ok=True)
+    # ===== STEP 1.2.3: 创建输出目录结构 =====
+    os.makedirs(config.CKPT.DIR, exist_ok=True)  # 模型检查点保存目录
+    os.makedirs(config.CKPT.RESULT_DIR, exist_ok=True)  # 评估结果保存目录
+    os.makedirs(config.LOGGER.DIR, exist_ok=True)  # 日志和tensorboard输出目录
 
+    # ===== STEP 1.2.4: CUDA设备检测和配置 =====
+    # 从配置中解析GPU编号
     if ':' in config.TRAIN.DEVICE:
-        nprocs = len(config.TRAIN.DEVICE.split(':')[-1].split(','))
+        nprocs = len(config.TRAIN.DEVICE.split(':')[-1].split(','))  # 计算GPU数量
+
+    if args.device:
+        config.defrost()
+        config.TRAIN.DEVICE = args.device
+        config.freeze()
+        nprocs = 1 if ':' not in config.TRAIN.DEVICE else len(config.TRAIN.DEVICE.split(':')[-1].split(','))
+
+    # 检查CUDA是否可用,如果不可用则降级到CPU
     if 'cuda' in config.TRAIN.DEVICE:
         if not torch.cuda.is_available():
             print(f"Cuda is not available(config is: {config.TRAIN.DEVICE}), will use cpu ...")
-            config.defrost()
-            config.TRAIN.DEVICE = "cpu"
-            config.freeze()
-            nprocs = 1
+            config.defrost()  # 解冻配置以允许修改
+            config.TRAIN.DEVICE = "cpu"  # 回退到CPU
+            config.freeze()  # 重新冻结配置
+            nprocs = 1  # 单进程CPU执行
 
+    if args.epochs:
+        config.defrost()
+        config.TRAIN.EPOCHS = args.epochs
+        config.freeze()
+
+    if args.for_test_index:
+        config.defrost()
+        config.DATA.FOR_TEST_INDEX = args.for_test_index
+        config.freeze()
+
+    if args.smoke_test:
+        config.defrost()
+        config.DATA.BATCH_SIZE = 1
+        config.DATA.FOR_TEST_INDEX = 1
+        config.TRAIN.EPOCHS = 1
+        config.freeze()
+
+    # ===== STEP 1.2.5: 保存配置到文件 =====
     if config.MODE == 'train':
+        # 将完整配置保存为YAML便于后续检查
         with open(os.path.join(config.CKPT.DIR, "config.yaml"), "w") as f:
             f.write(config.dump(allow_unicode=True))
 
+    # ===== STEP 1.2.6: 启动单/多进程 =====
     if config.TRAIN.DEVICE == 'cpu' or nprocs < 2:
+        # CPU模式或单GPU模式: 直接启动单进程
         print(f"Use single process, device:{config.TRAIN.DEVICE}")
-        main_worker(0, config, 1)
+        main_worker(0, config, 1)  # local_rank=0, world_size=1
     else:
+        # 多GPU模式: 使用分布式数据并行(DDP)
         print(f"Use {nprocs} processes ...")
+        # torch.multiprocessing.spawn: 为每个GPU启动一个独立进程
         mp.spawn(main_worker, nprocs=nprocs, args=(config, nprocs), join=True)
 
 
 def main_worker(local_rank, cfg, world_size):
+    """
+    STEP 1.3: 单进程工作函数 - 在每个GPU上执行的核心训练逻辑
+    ================================
+    功能: 负责一个进程的完整训练/评估流程(多GPU时每个GPU执行一份)
+
+    输入参数:
+      - local_rank: 当前进程的GPU编号(0, 1, 2, ...)
+      - cfg: 全局配置对象
+      - world_size: 总进程数(=GPU数量)
+
+    输出: 无(但通过日志和检查点文件输出结果)
+
+    【多进程分布式训练原理】:
+    - 每个GPU拥有一份模型副本
+    - 每个GPU处理batch的一部分数据
+    - 反向传播后,各GPU通过NCCL通信进行梯度同步
+    - 所有GPU使用同步后的梯度进行参数更新
+    """
+    # ===== STEP 1.3.1: 配置初始化 =====
+    # 为当前进程获取专属配置(含local_rank信息)
     config = get_rank_config(cfg, local_rank, world_size)
+
+    # 创建日志记录器(用于打印训练进度和错误信息)
     logger = build_logger(config)
+
+    # 创建TensorBoard写入器(用于可视化训练曲线)
     writer = SummaryWriter(config.CKPT.DIR)
+
+    # 打印配置备注信息
     logger.info(f"Comment: {config.COMMENT}")
+
+    # 记录当前进程ID(便于调试和日志追踪)
     cur_pid = os.getpid()
     logger.info(f"Current process id: {cur_pid}")
+
+    # 设置PyTorch Hub缓存目录
     torch.hub._hub_dir = config.CKPT.PYTORCH
     logger.info(f"Pytorch hub dir: {torch.hub._hub_dir}")
+
+    # 初始化随机种子和确定性选项(保证可重复性)
     init_env(config.SEED, config.TRAIN.DETERMINISTIC, config.DATA.NUM_WORKERS)
 
-    # try to solve additional process when using ddp
-    torch.cuda.set_device(local_rank)
-    torch.cuda.empty_cache()
+    # ===== STEP 1.3.2: GPU设备初始化 =====
+    # 为当前进程分配特定GPU
+    # 这句代码很关键：确保不同进程不会共享同一个GPU,造成资源竞争
+    if 'cuda' in config.TRAIN.DEVICE:
+        torch.cuda.set_device(local_rank)
+
+        # 清空GPU缓存,释放不必要的显存,提高可用显存
+        torch.cuda.empty_cache()
     print('local_rank: {}'.format(local_rank))
 
+    # ===== STEP 1.3.3: 模型和数据加载器构建 =====
+    # STEP 2: 构建模型(包括加载预训练权重)
+    # 返回: 模型、优化器、损失函数、学习率调度器
     model, optimizer, criterion, scheduler = build_model(config, logger)
+
+    # STEP 2: 构建数据加载器(训练集 + 验证集)
+    # 如果是多进程,DistributedSampler会自动分割数据到各GPU
     train_data_loader, val_data_loader = build_loader(config, logger)
 
+    # ===== STEP 1.3.4: 最终GPU绑定 =====
+    # 再次确保模型在正确的GPU上
+    # 这句代码是保险措施,防止build_model中的GPU转移出现问题
     if 'cuda' in config.TRAIN.DEVICE:
         torch.cuda.set_device(config.TRAIN.DEVICE)
 
+    # ===== STEP 1.3.5: 训练或评估 =====
     if config.MODE == 'train':
+        # 【STEP 3-7】执行训练流程
+        # 包括多个epoch的循环训练、验证、模型保存等
         train(model, train_data_loader, val_data_loader, optimizer, criterion, config, logger, writer, scheduler)
     else:
-        # iou_results, other_results = val_an_epoch(model, val_data_loader,
-        #                                           criterion, config, logger, writer=None,
-        #                                           epoch=config.TRAIN.START_EPOCH)
+        # 【STEP 6】执行评估/测试流程(不更新参数)
         iou_results, new_iou_results, oracle_iou_results = val_an_epoch(model, val_data_loader,
                                                   criterion, config, logger, writer=None,
                                                   epoch=config.TRAIN.START_EPOCH)
+
+        # 合并三种评估结果(不同类型的布局标注对应不同的IoU指标)
         results = dict(iou_results, **new_iou_results, **oracle_iou_results)
+
+        # ===== STEP 6.4: 保存评估结果 =====
+        # 将评估结果保存为JSON格式,便于后续分析
         if config.SAVE_EVAL:
             save_path = os.path.join(config.CKPT.RESULT_DIR, f"result.json")
             with open(save_path, 'w+') as f:
@@ -186,19 +354,19 @@ def save(model, optimizer, epoch, iou_d, new_iou_d, oracle_iou_d, logger, writer
     if config.MODEL.TYPE == 'occlusion':
         # save_3d_iou = (iou_d['full_3d'] + new_iou_d['new_full_3d'])/2
         save_3d_iou = iou_d['full_3d']
-        model.save(optimizer, epoch, 
-                   accuracy=save_3d_iou, 
-                   logger=logger, 
-                   acc_d=iou_d, 
+        model.save(optimizer, epoch,
+                   accuracy=save_3d_iou,
+                   logger=logger,
+                   acc_d=iou_d,
                    acc_d_new=new_iou_d,
                    acc_d_oracle=oracle_iou_d,
                    config=config)
     else:
         save_3d_iou = iou_d['full_3d']
-        model.save(optimizer, epoch, 
-                   accuracy=save_3d_iou, 
-                   logger=logger, 
-                   acc_d=iou_d, 
+        model.save(optimizer, epoch,
+                   accuracy=save_3d_iou,
+                   logger=logger,
+                   acc_d=iou_d,
                    config=config)
     for k in model.acc_d:
         writer.add_scalar(f"BestACC/{k}", model.acc_d[k]['acc'], epoch)
@@ -422,8 +590,8 @@ def val_an_epoch(model, val_data_loader, criterion, config, logger, writer, epoc
                 depth_xyz = depth2xyz(dt['depth'][b].detach().cpu().numpy())
                 new_depth_xyz = depth2xyz(dt['new_depth'][b].detach().cpu().numpy())
                 floor_bd, _ = corners2boundaries(dt['ratio'][b].detach().cpu().numpy(), corners_xyz=depth_xyz, step=None, length=1024, visible=True)  # if set visible=False, then the boundary shape might exceed 1024
-                new_floor_bd, _ = corners2boundaries(dt['ratio'][b].detach().cpu().numpy(), corners_xyz=new_depth_xyz, step=None, length=1024, visible=True)    
-                
+                new_floor_bd, _ = corners2boundaries(dt['ratio'][b].detach().cpu().numpy(), corners_xyz=new_depth_xyz, step=None, length=1024, visible=True)
+
                 # TODO: few cases boundary shape might < 1024, need to fix it (e.g., interpolation)
                 # tmp solution: skip this ambiguity prediction
                 if floor_bd.shape[0] != 1024 or new_floor_bd.shape[0] != 1024:
@@ -434,7 +602,7 @@ def val_an_epoch(model, val_data_loader, criterion, config, logger, writer, epoc
                 new_floor_pixel_v = uv2pixel(new_floor_bd)[:, 1]
 
                 pixel_diff = np.absolute(floor_pixel_v - new_floor_pixel_v)
-                
+
                 # opening_b = np.zeros(1024)    # all predict 0
                 # opening_b = np.where(pixel_diff > 2, 1, 0)   # 1 if more than 2 pixels difference
                 opening_b = np.where(pixel_diff > 2, pixel_diff, 0)   # confidence score
@@ -502,7 +670,7 @@ def val_an_epoch(model, val_data_loader, criterion, config, logger, writer, epoc
             # epoch_new_iou_d['opening_recall'].append(opening_metrics_batch[2])
             # epoch_new_iou_d['opening_f1'].append(opening_metrics_batch[3])
 
-            
+
             # new head prediction compare to origin label
             n2o_visb_iou, n2o_full_iou, n2o_iou_height, n2o_pano_bds, n2o_full_iou_2ds, n2o_full_iou_3ds, _ = calc_accuracy(tensor2np_d(dt), tensor2np_d(gt),
                                                                                visualization, h=vis_w // 2, second_type=True, gt_label='origin')
@@ -511,7 +679,7 @@ def val_an_epoch(model, val_data_loader, criterion, config, logger, writer, epoc
             epoch_n2o_iou_d['n2o_full_2d'].append(n2o_full_iou[0])
             epoch_n2o_iou_d['n2o_full_3d'].append(n2o_full_iou[1])
             epoch_n2o_iou_d['n2o_height'].append(n2o_iou_height)
-            
+
             # # origin head prediction compare to new label
             # o2n_visb_iou, o2n_full_iou, o2n_iou_height, o2n_pano_bds, o2n_full_iou_2ds, o2n_full_iou_3ds, _ = calc_accuracy(tensor2np_d(dt), tensor2np_d(gt),
             #                                                                    visualization, h=vis_w // 2, second_type=False, gt_label='new')
@@ -694,12 +862,12 @@ def val_an_epoch(model, val_data_loader, criterion, config, logger, writer, epoc
             if writer:
                 # writer.add_images('VIS/Merge', np.array(imgs), global_step)
                 pass    # too many images to save, tensorboard event file will be too large
-            
+
             if config.SAVE_EVAL:
                 # if ZInD, exchange branch order back to visible/raw (the original model output) to follow extended/enclosed order for images saving
                 if config.EVAL.EVAL_GT_MISMATCH:
                     imgs[:], new_imgs[:] = new_imgs[:], imgs[:]
-                
+
                 iou_first_path = os.path.join(config.CKPT.RESULT_DIR, 'extended_results')
                 os.makedirs(iou_first_path, exist_ok=True)
                 for k in range(len(imgs)):
@@ -759,7 +927,7 @@ def val_an_epoch(model, val_data_loader, criterion, config, logger, writer, epoc
 
     if config.LOCAL_RANK != 0:
         return
-    
+
     # Calculate average precision for opening (whole dataset per column)
     # print('--- @ threshold 10 ---')
     # ap_at_10, precision_at_10, recall_at_10 = calc_ap(gt['opening'], dt['opening'], threshold=10)
@@ -835,7 +1003,7 @@ def val_an_epoch(model, val_data_loader, criterion, config, logger, writer, epoc
             # # write new head better image ids
             # with open(config.CKPT.RESULT_DIR+'/new_better_id.txt', 'a') as f:
             #     for file in new_better_id:
-            #         f.write(file) 
+            #         f.write(file)
 
             # write original head better image ids larger case ----------------------------
             # for MP3D is original label, for ZInD is raw label

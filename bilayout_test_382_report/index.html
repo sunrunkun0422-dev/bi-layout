@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Bi-Layout 382 Best Test Analysis</title>
+  <style>
+    :root {
+      --ink: #182232;
+      --muted: #5e6875;
+      --line: #d9e0e8;
+      --panel: #f6f8fb;
+      --blue: #4775b7;
+      --green: #34a07a;
+      --orange: #db842e;
+      --red: #c94d4d;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: #e9edf2;
+      color: var(--ink);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans CJK SC", "Microsoft YaHei", Arial, sans-serif;
+      line-height: 1.55;
+    }
+    .slide {
+      width: min(1280px, calc(100vw - 48px));
+      min-height: 720px;
+      margin: 32px auto;
+      padding: 46px 56px;
+      background: white;
+      border: 1px solid var(--line);
+      box-shadow: 0 18px 48px rgba(22, 32, 45, .12);
+    }
+    .kicker {
+      color: var(--blue);
+      font-size: 18px;
+      font-weight: 700;
+      letter-spacing: .02em;
+      margin-bottom: 12px;
+    }
+    h1 {
+      margin: 0 0 18px;
+      font-size: 52px;
+      line-height: 1.08;
+      letter-spacing: 0;
+    }
+    h2 {
+      margin: 0 0 18px;
+      font-size: 36px;
+      line-height: 1.15;
+      letter-spacing: 0;
+    }
+    p {
+      margin: 0 0 14px;
+      font-size: 21px;
+      color: var(--muted);
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 18px;
+      margin: 28px 0;
+    }
+    .card {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 20px;
+      background: var(--panel);
+    }
+    .metric {
+      font-size: 42px;
+      line-height: 1;
+      font-weight: 800;
+      margin: 4px 0 10px;
+    }
+    .label {
+      color: var(--muted);
+      font-size: 18px;
+    }
+    .blue { color: var(--blue); }
+    .green { color: var(--green); }
+    .orange { color: var(--orange); }
+    .red { color: var(--red); }
+    img {
+      max-width: 100%;
+      display: block;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #f5f7fa;
+    }
+    .hero-img {
+      margin-top: 28px;
+    }
+    .two-col {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 28px;
+      align-items: start;
+      margin-top: 22px;
+    }
+    .bullets {
+      display: grid;
+      gap: 14px;
+      margin-top: 22px;
+    }
+    .bullet {
+      padding: 16px 18px;
+      border-left: 5px solid var(--blue);
+      background: var(--panel);
+      font-size: 21px;
+      color: var(--ink);
+    }
+    .small {
+      font-size: 17px;
+      color: var(--muted);
+    }
+    .footer {
+      margin-top: 26px;
+      padding-top: 14px;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 16px;
+    }
+    @media (max-width: 900px) {
+      .slide { width: calc(100vw - 20px); padding: 28px 22px; }
+      h1 { font-size: 36px; }
+      h2 { font-size: 28px; }
+      .grid, .two-col { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <section class="slide">
+    <div class="kicker">Bi-Layout / MatterportLayout / epoch 382 best checkpoint</div>
+    <h1>测试集结果分析</h1>
+    <p>本次评估使用 2026-05-27 21:39 保存的 best checkpoint：<b>model_2026-05-27-21-39-39_best_0.8243_382.pkl</b>。</p>
+    <p>测试集共 458 张，全量保存可视化结果。由于原始配置的 AMP 在 test 阶段触发 half/float 类型不一致，本次仅关闭 AMP，模型结构和权重不变。</p>
+    <div class="grid">
+      <div class="card">
+        <div class="label">Original head test full_3d</div>
+        <div class="metric blue">0.7952</div>
+        <div class="small">full_2d = 0.8204</div>
+      </div>
+      <div class="card">
+        <div class="label">New head test full_3d</div>
+        <div class="metric green">0.7979</div>
+        <div class="small">full_2d = 0.8234</div>
+      </div>
+      <div class="card">
+        <div class="label">Oracle upper bound full_3d</div>
+        <div class="metric orange">0.8101</div>
+        <div class="small">按 GT 选择更好 head，不是可部署结果</div>
+      </div>
+    </div>
+    <div class="footer">命令：python main.py --cfg src/config/mp3d_test_o0.yaml --mode test --ckpt_option best --save_eval</div>
+  </section>
+
+  <section class="slide">
+    <h2>一眼结论</h2>
+    <div class="bullets">
+      <div class="bullet">模型是有效的：test full_3d 接近 0.80，说明它确实学到了布局几何，而不是只在训练集上记忆。</div>
+      <div class="bullet">但泛化有落差：val best 的 full_3d 是 0.8243/0.8250，test 降到 0.7952/0.7979，下降约 2.7 到 2.9 个百分点。</div>
+      <div class="bullet">new head 在 test 上略好，但优势很小：full_3d 只比 original 高 0.0027，不能单独证明双头设计已经充分发挥。</div>
+      <div class="bullet">oracle 还能提升到 0.8101，说明两个 head 有互补性；真正短板是缺少一个可靠的 head selector。</div>
+    </div>
+  </section>
+
+  <section class="slide">
+    <h2>Val 到 Test 的落差</h2>
+    <img class="hero-img" src="assets/metrics_val_test.png" alt="val test metric comparison">
+    <p class="small">val 指标来自 epoch 382；test 指标来自本次 2026-05-28 20:47 的评估。</p>
+  </section>
+
+  <section class="slide">
+    <h2>测试集分布：平均数被长尾失败拖低</h2>
+    <img class="hero-img" src="assets/distribution_summary.png" alt="distribution summary">
+    <p class="small">保存图片文件名里的 IoU 是 full 2D IoU。Original head 有 24 张低于 0.5，new head 有 19 张低于 0.5；如果用 GT oracle 选 head，低于 0.5 的样例只剩 5 张。</p>
+  </section>
+
+  <section class="slide">
+    <h2>成功样例：简单、边界清晰时很稳</h2>
+    <img class="hero-img" src="assets/case_success.png" alt="success case">
+    <p class="small">这个样例两个 head 都接近 0.98。模型在规整房间、墙面边界明确、遮挡较少时表现很好。</p>
+  </section>
+
+  <section class="slide">
+    <h2>互补样例：new head 救回 original</h2>
+    <img class="hero-img" src="assets/case_new_better.png" alt="new head better case">
+    <p class="small">同一张图中 original head 几乎选错布局，new head 能恢复到高 IoU。这说明双头不是完全重复的，确实存在互补信息。</p>
+  </section>
+
+  <section class="slide">
+    <h2>互补样例：original head 救回 new</h2>
+    <img class="hero-img" src="assets/case_original_better.png" alt="original head better case">
+    <p class="small">反过来也成立：new head 有时会崩掉，而 original head 仍然可用。因此不能简单固定选择 new head。</p>
+  </section>
+
+  <section class="slide">
+    <h2>失败样例：两个 head 都不可靠</h2>
+    <img class="hero-img" src="assets/case_both_fail.png" alt="both head fail case">
+    <p class="small">这类样例是审稿人最容易质疑的地方：不是边界轻微偏移，而是布局拓扑或房间范围判断错误。平均指标不错，但长尾失败仍然明显。</p>
+  </section>
+
+  <section class="slide">
+    <h2>审稿人视角的不足</h2>
+    <div class="bullets">
+      <div class="bullet">只报 oracle 会被质疑，因为 oracle 是按 GT 事后选择 head，不能作为真实推理结果。</div>
+      <div class="bullet">双头没有显式选择机制。test 中 original/new 谁更好接近五五开，说明需要 confidence 或 selector，而不是固定取某个 head。</div>
+      <div class="bullet">损失主要是 depth、ratio、grad，对拓扑错误的惩罚不够；低 IoU 样例说明需要边界、角点、polygon consistency 或 IoU 类约束。</div>
+      <div class="bullet">模型参数约 102M，训练集相对不大，且 dropout=0、weight_decay=0、无学习率衰减，容易出现 val 到 test 的泛化落差。</div>
+    </div>
+  </section>
+
+  <section class="slide">
+    <h2>建议的下一轮实验</h2>
+    <div class="bullets">
+      <div class="bullet">加一个 head selector/confidence head：训练它判断 original/new 哪个更可信，目标是逼近 oracle 的 0.8101。</div>
+      <div class="bullet">启用更强泛化设置：AdamW + weight_decay 1e-4，dropout 0.1，cosine 或 plateau LR decay，早停在 380 到 440 epoch 附近。</div>
+      <div class="bullet">增加几何一致性约束：低权重加入 BoundaryLoss、corner heatmap 或 polygon/IoU consistency，重点减少 IoU&lt;0.5 的长尾失败。</div>
+      <div class="bullet">做分层表格：按 room complexity、wall number、visible/full、occlusion 强度分组，证明改进不是只提高平均值。</div>
+    </div>
+  </section>
+</body>
+</html>

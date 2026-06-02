@@ -37,14 +37,13 @@ TRAIN:
       WEIGHTS: [ 1.0, 1.0 ]
   BASE_LR:
     1e-4
-  # RESUME_LAST: False
   RESUME_LAST: True
   OPTIMIZER:
     NAME: 'adam'
-  EPOCHS: 2001  
+  EPOCHS: 2001
 DATA:
   DATASET: 'mp3d'
-  DIR: 'src/dataset/mp3d' # your MatterportLayout dataset path
+  DIR: 'src/dataset/mp3d'
   BATCH_SIZE: 10
   NUM_WORKERS: 4
   FOR_TEST_INDEX: None
@@ -53,6 +52,4 @@ DATA:
     STRETCH: True
     ROTATE: True
     GAMMA: True
-# EVAL:
-#   OPENING: True # the model will have opening output if True
-AMP_OPT_LEVEL: 'O1'
+AMP_OPT_LEVEL: 'O0'

@@ -21,7 +21,8 @@ def build_model(config, logger):
     ddp = config.WORLD_SIZE > 1
     if ddp:
         logger.info(f"use ddp")
-        dist.init_process_group("nccl", init_method='tcp://127.0.0.1:23456', rank=config.LOCAL_RANK,
+        backend = "nccl" if 'cuda' in config.TRAIN.DEVICE else "gloo"
+        dist.init_process_group(backend, init_method='tcp://127.0.0.1:23456', rank=config.LOCAL_RANK,
                                 world_size=config.WORLD_SIZE)
 
     device = config.TRAIN.DEVICE
@@ -44,7 +45,10 @@ def build_model(config, logger):
         optimizer = build_optimizer(config, model, logger)
 
     config.defrost()
-    config.TRAIN.START_EPOCH = model.load(device, logger,  optimizer, best=config.MODE != 'train' or not config.TRAIN.RESUME_LAST, option=config.EVAL.CKPT_OPTION)
+    if config.MODE == 'train' and not config.TRAIN.LOAD_CKPT:
+        config.TRAIN.START_EPOCH = 0
+    else:
+        config.TRAIN.START_EPOCH = model.load(device, logger,  optimizer, best=config.MODE != 'train' or not config.TRAIN.RESUME_LAST, option=config.EVAL.CKPT_OPTION)
     config.freeze()
 
     if config.MODE == 'train' and len(config.MODEL.FINE_TUNE) > 0:
@@ -70,12 +74,23 @@ def build_model(config, logger):
             scheduler = None
 
         if config.AMP_OPT_LEVEL != "O0" and 'cuda' in device:
-            import apex
-            logger.info(f"use amp:{config.AMP_OPT_LEVEL}")
-            model, optimizer = apex.amp.initialize(model, optimizer, opt_level=config.AMP_OPT_LEVEL, verbosity=0)
+            try:
+                import apex
+            except ImportError:
+                logger.warning("apex is not installed, fallback to AMP_OPT_LEVEL=O0")
+                config.defrost()
+                config.AMP_OPT_LEVEL = "O0"
+                config.freeze()
+            else:
+                logger.info(f"use amp:{config.AMP_OPT_LEVEL}")
+                model, optimizer = apex.amp.initialize(model, optimizer, opt_level=config.AMP_OPT_LEVEL, verbosity=0)
         if ddp:
-            model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[config.TRAIN.DEVICE],
-                                                              broadcast_buffers=True)  # use rank:0 bn
+            if 'cuda' in config.TRAIN.DEVICE:
+                device_id = int(config.TRAIN.DEVICE.split(':')[-1])
+                model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[device_id],
+                                                                  broadcast_buffers=True)  # use rank:0 bn
+            else:
+                model = torch.nn.parallel.DistributedDataParallel(model, broadcast_buffers=True)
 
     criterion = build_criterion(config, logger)
     if optimizer is not None:
