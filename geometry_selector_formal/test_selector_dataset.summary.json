@@ -1,0 +1,14 @@
+{
+  "n": 458,
+  "original_full_2d": 0.8203836149151249,
+  "original_full_3d": 0.7951879138437263,
+  "new_as_origin_full_2d": 0.820368069475939,
+  "new_as_origin_full_3d": 0.7952797445263611,
+  "oracle_full_2d": 0.8358751474942756,
+  "oracle_full_3d": 0.8101399167890968,
+  "label_full_3d_new_count": 238,
+  "label_full_3d_original_count": 220,
+  "original_low_iou_2d_rate": 0.05240174672489083,
+  "new_low_iou_2d_rate": 0.048034934497816595,
+  "oracle_low_iou_2d_rate": 0.026200873362445413
+}

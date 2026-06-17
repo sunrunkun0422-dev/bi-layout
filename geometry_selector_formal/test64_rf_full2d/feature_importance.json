@@ -1,0 +1,162 @@
+[
+  {
+    "feature": "branch_absdiff_boundary_jump_count",
+    "importance": 0.03351591566598967
+  },
+  {
+    "feature": "branch_absdiff_boundary_jump_frac",
+    "importance": 0.021741882616547813
+  },
+  {
+    "feature": "original_poly_height",
+    "importance": 0.02081046209924308
+  },
+  {
+    "feature": "new_depth_grad2_abs_min",
+    "importance": 0.020374502795909643
+  },
+  {
+    "feature": "branch_diff_depth_grad1_abs_mean",
+    "importance": 0.017278829977283666
+  },
+  {
+    "feature": "branch_absdiff_poly_area",
+    "importance": 0.015157981175795579
+  },
+  {
+    "feature": "branch_diff_poly_perimeter",
+    "importance": 0.014744932796430084
+  },
+  {
+    "feature": "branch_depth_absdiff_min",
+    "importance": 0.014172121557738619
+  },
+  {
+    "feature": "new_poly_centroid_radius",
+    "importance": 0.014007575806451995
+  },
+  {
+    "feature": "branch_depth_corr",
+    "importance": 0.013798564067510071
+  },
+  {
+    "feature": "branch_ratio_boundary_jump_count",
+    "importance": 0.01322706390384356
+  },
+  {
+    "feature": "branch_ratio_boundary_jump_frac",
+    "importance": 0.012760788160151084
+  },
+  {
+    "feature": "branch_ratio_poly_perimeter",
+    "importance": 0.012373989413468749
+  },
+  {
+    "feature": "branch_absdiff_poly_height",
+    "importance": 0.012012681786436689
+  },
+  {
+    "feature": "branch_depth_signeddiff_p05",
+    "importance": 0.011914427336640127
+  },
+  {
+    "feature": "branch_ratio_depth_grad2_abs_mean",
+    "importance": 0.011217384394069151
+  },
+  {
+    "feature": "original_poly_minx",
+    "importance": 0.010837369757926974
+  },
+  {
+    "feature": "branch_diff_boundary_jump_count",
+    "importance": 0.010799278500637487
+  },
+  {
+    "feature": "branch_diff_poly_centroid_radius",
+    "importance": 0.010689384143422272
+  },
+  {
+    "feature": "original_radius_min",
+    "importance": 0.010665024814639396
+  },
+  {
+    "feature": "branch_ratio_depth_grad1_abs_mean",
+    "importance": 0.010619445690333408
+  },
+  {
+    "feature": "branch_ratio_poly_height",
+    "importance": 0.010574049461819363
+  },
+  {
+    "feature": "branch_depth_signeddiff_p95",
+    "importance": 0.010568646202258994
+  },
+  {
+    "feature": "new_radius_p50",
+    "importance": 0.010431505149680704
+  },
+  {
+    "feature": "new_boundary_jump_threshold",
+    "importance": 0.01038894617937802
+  },
+  {
+    "feature": "branch_diff_poly_height",
+    "importance": 0.010346254048962406
+  },
+  {
+    "feature": "new_depth_grad1_abs_mean",
+    "importance": 0.01001080178335759
+  },
+  {
+    "feature": "original_boundary_jump_count",
+    "importance": 0.009900214581283484
+  },
+  {
+    "feature": "original_poly_miny",
+    "importance": 0.009694539318407417
+  },
+  {
+    "feature": "original_depth_grad2_abs_p05",
+    "importance": 0.009488737983846616
+  },
+  {
+    "feature": "new_depth_grad1_abs_min",
+    "importance": 0.00929344456951483
+  },
+  {
+    "feature": "original_depth_grad2_abs_p50",
+    "importance": 0.009268975988098735
+  },
+  {
+    "feature": "branch_absdiff_poly_perimeter",
+    "importance": 0.009265203881047278
+  },
+  {
+    "feature": "new_depth_max",
+    "importance": 0.009197458004735318
+  },
+  {
+    "feature": "original_depth_p50",
+    "importance": 0.009104601775436243
+  },
+  {
+    "feature": "branch_absdiff_radius_mean",
+    "importance": 0.009021060777926545
+  },
+  {
+    "feature": "branch_ratio_depth_grad1_abs_max",
+    "importance": 0.008963349283639606
+  },
+  {
+    "feature": "new_poly_perimeter",
+    "importance": 0.008803820946292057
+  },
+  {
+    "feature": "new_depth_min",
+    "importance": 0.008417303799985218
+  },
+  {
+    "feature": "branch_diff_poly_area",
+    "importance": 0.008363794938995386
+  }
+]

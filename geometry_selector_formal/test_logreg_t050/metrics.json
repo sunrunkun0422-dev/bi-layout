@@ -1,0 +1,38 @@
+{
+  "n": 458,
+  "metric": "full_3d",
+  "original_mean": 0.7951879138437263,
+  "new_mean": 0.7952797445263611,
+  "best_fixed_branch": "new",
+  "best_fixed_mean": 0.7952797445263611,
+  "selector_mean": 0.7990813571212058,
+  "oracle_mean": 0.8101399167890968,
+  "selector_gain_vs_best_fixed": 0.0038016125948446833,
+  "oracle_gap_captured": 0.25582560737723337,
+  "selector_accuracy": 0.5698689956331878,
+  "best_fixed_accuracy": 0.519650655021834,
+  "original_low_iou_rate": 0.0611353711790393,
+  "new_low_iou_rate": 0.05458515283842795,
+  "best_fixed_low_iou_rate": 0.05458515283842795,
+  "selector_low_iou_rate": 0.05458515283842795,
+  "oracle_low_iou_rate": 0.03711790393013101,
+  "new_better_count": 238,
+  "original_better_count": 220,
+  "confusion_matrix": [
+    [
+      111,
+      109
+    ],
+    [
+      88,
+      150
+    ]
+  ],
+  "mode": "cross_val",
+  "model": "logreg",
+  "label": "label_full_3d",
+  "folds": 5,
+  "feature_count": 148,
+  "decision_threshold": 0.5,
+  "mean_prob_new": 0.505653332459656
+}

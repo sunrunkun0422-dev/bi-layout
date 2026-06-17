@@ -1,0 +1,14 @@
+{
+  "n": 2,
+  "original_full_2d": 0.8619671709129225,
+  "original_full_3d": 0.8467119550557505,
+  "new_as_origin_full_2d": 0.8513968150260749,
+  "new_as_origin_full_3d": 0.8362973581350641,
+  "oracle_full_2d": 0.8619671709129225,
+  "oracle_full_3d": 0.8467119550557505,
+  "label_full_3d_new_count": 0,
+  "label_full_3d_original_count": 2,
+  "original_low_iou_2d_rate": 0.0,
+  "new_low_iou_2d_rate": 0.0,
+  "oracle_low_iou_2d_rate": 0.0
+}

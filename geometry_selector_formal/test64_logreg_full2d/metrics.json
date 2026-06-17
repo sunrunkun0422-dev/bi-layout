@@ -1,0 +1,36 @@
+{
+  "n": 64,
+  "metric": "full_2d",
+  "original_mean": 0.792096350703887,
+  "new_mean": 0.762822896279381,
+  "best_fixed_branch": "original",
+  "best_fixed_mean": 0.792096350703887,
+  "selector_mean": 0.7758280690147782,
+  "oracle_mean": 0.798406616937714,
+  "selector_gain_vs_best_fixed": -0.016268281689108766,
+  "oracle_gap_captured": -2.578065819457898,
+  "selector_accuracy": 0.515625,
+  "best_fixed_accuracy": 0.578125,
+  "original_low_iou_rate": 0.046875,
+  "new_low_iou_rate": 0.078125,
+  "best_fixed_low_iou_rate": 0.046875,
+  "selector_low_iou_rate": 0.078125,
+  "oracle_low_iou_rate": 0.03125,
+  "new_better_count": 27,
+  "original_better_count": 37,
+  "confusion_matrix": [
+    [
+      20,
+      17
+    ],
+    [
+      14,
+      13
+    ]
+  ],
+  "mode": "cross_val",
+  "model": "logreg",
+  "label": "label_full_2d",
+  "folds": 5,
+  "feature_count": 148
+}

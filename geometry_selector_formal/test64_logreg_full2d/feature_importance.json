@@ -1,0 +1,162 @@
+[
+  {
+    "feature": "branch_ratio_poly_centroid_radius",
+    "importance": 0.8356700148653848
+  },
+  {
+    "feature": "original_poly_minx",
+    "importance": 0.6411903275355098
+  },
+  {
+    "feature": "branch_absdiff_boundary_jump_count",
+    "importance": 0.6217289692635591
+  },
+  {
+    "feature": "branch_absdiff_boundary_jump_frac",
+    "importance": 0.6217289692635591
+  },
+  {
+    "feature": "new_poly_minx",
+    "importance": 0.5665942563518466
+  },
+  {
+    "feature": "new_depth_grad2_abs_min",
+    "importance": 0.5595611108759881
+  },
+  {
+    "feature": "new_poly_height",
+    "importance": 0.5401592009681886
+  },
+  {
+    "feature": "new_depth_grad1_abs_min",
+    "importance": 0.5393961537436349
+  },
+  {
+    "feature": "original_poly_height",
+    "importance": 0.5294695957724579
+  },
+  {
+    "feature": "branch_ratio_depth_grad1_abs_max",
+    "importance": 0.5260455508376444
+  },
+  {
+    "feature": "branch_ratio_depth_grad2_abs_mean",
+    "importance": 0.5220096447883342
+  },
+  {
+    "feature": "branch_depth_signeddiff_p05",
+    "importance": 0.4889272266272897
+  },
+  {
+    "feature": "branch_depth_absdiff_p95",
+    "importance": 0.4810977396916325
+  },
+  {
+    "feature": "new_depth_grad1_abs_p50",
+    "importance": 0.4587512928915012
+  },
+  {
+    "feature": "new_depth_grad2_abs_p50",
+    "importance": 0.4576706131380947
+  },
+  {
+    "feature": "branch_depth_absdiff_p50",
+    "importance": 0.44965721684043874
+  },
+  {
+    "feature": "branch_depth_absdiff_p05",
+    "importance": 0.4387301653817552
+  },
+  {
+    "feature": "new_depth_grad1_abs_p95",
+    "importance": 0.4220518258176004
+  },
+  {
+    "feature": "original_depth_grad2_abs_p95",
+    "importance": 0.41963052034021164
+  },
+  {
+    "feature": "new_depth_grad2_abs_p05",
+    "importance": 0.39906298760197173
+  },
+  {
+    "feature": "original_depth_grad2_abs_min",
+    "importance": 0.3872743074305345
+  },
+  {
+    "feature": "new_poly_miny",
+    "importance": 0.3758872207521339
+  },
+  {
+    "feature": "original_depth_p95",
+    "importance": 0.36556394934123104
+  },
+  {
+    "feature": "original_radius_p95",
+    "importance": 0.36556376238674715
+  },
+  {
+    "feature": "branch_depth_signeddiff_p50",
+    "importance": 0.3635558971121936
+  },
+  {
+    "feature": "original_poly_miny",
+    "importance": 0.34739145908520525
+  },
+  {
+    "feature": "branch_absdiff_poly_height",
+    "importance": 0.3378143461605791
+  },
+  {
+    "feature": "branch_depth_signeddiff_max",
+    "importance": 0.33337210487388913
+  },
+  {
+    "feature": "branch_absdiff_poly_hull_area_ratio",
+    "importance": 0.30880569948449366
+  },
+  {
+    "feature": "branch_ratio_depth_grad1_abs_mean",
+    "importance": 0.30193809525908377
+  },
+  {
+    "feature": "original_poly_centroid_radius",
+    "importance": 0.28842749946913226
+  },
+  {
+    "feature": "branch_diff_radius_max",
+    "importance": 0.28471703632145284
+  },
+  {
+    "feature": "branch_absdiff_depth_grad2_abs_mean",
+    "importance": 0.2812670148022866
+  },
+  {
+    "feature": "new_depth_p95",
+    "importance": 0.2806999791391205
+  },
+  {
+    "feature": "new_radius_p95",
+    "importance": 0.28069986831324023
+  },
+  {
+    "feature": "original_depth_grad1_abs_p95",
+    "importance": 0.2788731365723256
+  },
+  {
+    "feature": "new_poly_centroid_radius",
+    "importance": 0.2731999797799283
+  },
+  {
+    "feature": "branch_absdiff_depth_grad1_abs_mean",
+    "importance": 0.26740312282602996
+  },
+  {
+    "feature": "branch_depth_signeddiff_p95",
+    "importance": 0.2671826339618907
+  },
+  {
+    "feature": "branch_absdiff_depth_grad1_abs_max",
+    "importance": 0.25962042387113843
+  }
+]
