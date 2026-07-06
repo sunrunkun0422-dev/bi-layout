@@ -28,7 +28,7 @@ def make_layout(points):
 
 
 class JointLayoutTest(unittest.TestCase):
-    def test_aligns_room_b_to_opposite_side_of_shared_door(self):
+    def test_aligns_room_b_to_opposite_side_of_shared_opening(self):
         layout_a = make_layout([[-2, -2], [2, -2], [2, 2], [-2, 2]])
         layout_b = make_layout([[-2, -2], [2, -2], [2, 2], [-2, 2]])
 
@@ -43,9 +43,10 @@ class JointLayoutTest(unittest.TestCase):
         room_b_center = np.asarray(result["rooms"][1]["boundary"]).mean(axis=0)
         self.assertLess(room_a_center[0], 2)
         self.assertGreater(room_b_center[0], 2)
+        np.testing.assert_allclose(result["sharedOpening"]["worldEndpoints"], [[2, -1], [2, 1]])
         np.testing.assert_allclose(result["sharedDoor"]["worldEndpoints"], [[2, -1], [2, 1]])
 
-    def test_calibrates_scale_from_shared_door_width(self):
+    def test_calibrates_scale_from_shared_opening_width(self):
         layout_a = make_layout([[-2, -2], [2, -2], [2, 2], [-2, 2]])
         layout_b = make_layout([[-1, -1], [1, -1], [1, 1], [-1, 1]])
 
@@ -57,9 +58,10 @@ class JointLayoutTest(unittest.TestCase):
         )
 
         self.assertAlmostEqual(result["alignment"]["roomBScale"], 2.0)
-        np.testing.assert_allclose(result["sharedDoor"]["worldEndpoints"], [[2, -1], [2, 1]])
+        self.assertTrue(result["alignment"]["scaleCalibratedFromSharedOpening"])
+        np.testing.assert_allclose(result["sharedOpening"]["worldEndpoints"], [[2, -1], [2, 1]])
 
-    def test_rejects_invalid_door_spec(self):
+    def test_rejects_invalid_opening_spec(self):
         with self.assertRaises(ValueError):
             DoorSpec.parse("1:0.8:0.2")
 
@@ -76,7 +78,7 @@ class JointLayoutTest(unittest.TestCase):
             render_joint_boundary_svg(result, output_path)
             with open(output_path, "r") as file:
                 svg = file.read()
-        self.assertIn("shared door", svg)
+        self.assertIn("shared opening", svg)
         self.assertIn("A:0", svg)
         self.assertIn("B:0", svg)
 

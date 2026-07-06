@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Join two predicted room layouts through a shared doorway."""
+"""Join two predicted room layouts through a shared opening/interface."""
 import argparse
 import json
 import os
@@ -15,30 +15,34 @@ from utils.joint_layout import DoorSpec, build_joint_layout, render_joint_bounda
 
 def parse_option():
     parser = argparse.ArgumentParser(
-        description="Align two room-layout predictions through a shared door and export their boundary lines."
+        description="Align two room-layout predictions through a shared opening/interface and export boundary lines."
     )
     parser.add_argument("--layout_a", required=True, help="room A prediction JSON from inference.py")
     parser.add_argument("--layout_b", required=True, help="room B prediction JSON from inference.py")
     parser.add_argument(
+        "--opening_a",
         "--door_a",
         required=True,
         type=DoorSpec.parse,
+        dest="door_a",
         metavar="WALL:START:END",
-        help="shared door segment on room A, for example 1:0.25:0.55",
+        help="shared opening segment on room A, for example 1:0.25:0.55",
     )
     parser.add_argument(
+        "--opening_b",
         "--door_b",
         required=True,
         type=DoorSpec.parse,
+        dest="door_b",
         metavar="WALL:START:END",
-        help="shared door segment on room B, for example 3:0.30:0.60",
+        help="shared opening segment on room B, for example 3:0.30:0.60",
     )
     parser.add_argument("--output_dir", default="src/output/joint_layout", help="output directory")
     parser.add_argument("--name", default="a_b_joint", help="output file prefix")
     parser.add_argument(
         "--preserve_scale",
         action="store_true",
-        help="keep each room prediction scale instead of calibrating room B with the shared door width",
+        help="keep each room prediction scale instead of calibrating room B with the shared opening width",
     )
     return parser.parse_args()
 

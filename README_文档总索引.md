@@ -20,11 +20,19 @@
    - 看可编辑 Mermaid 网络图
    - 适合一起设计跨场景估计模块
 
-5. [几何置信度选择项目模板与面试分析.md](几何置信度选择项目模板与面试分析.md)
+5. [跨场景共享开口融合网络架构_可编辑.md](跨场景共享开口融合网络架构_可编辑.md)
+   - 看跨场景共享开口融合的完整网络架构、模块输入输出和训练/推理流程
+   - 适合确认“extended 能过去就融合估计”的需求边界
+
+6. [跨场景共享开口融合实验汇报PPT.md](跨场景共享开口融合实验汇报PPT.md)
+   - 看 ZInD 相邻全景小实验的 STAR 汇报版 PPT
+   - 适合项目汇报、组会展示和后续改成正式 `.pptx`
+
+7. [几何置信度选择项目模板与面试分析.md](几何置信度选择项目模板与面试分析.md)
    - 看几何一致性置信度选择项目模板
    - 适合准备简历、实验计划和面试答辩
 
-6. [README_几何置信度选择.md](README_几何置信度选择.md)
+8. [README_几何置信度选择.md](README_几何置信度选择.md)
    - 看几何置信度选择项目 README
    - 适合作为项目首页、复现实验入口和简历项目说明
 
@@ -40,6 +48,8 @@
 - 想知道函数参数和返回值: 看 [快速参考.md](快速参考.md)
 - 想知道训练、评估、推理的区别: 先看 [系统流程分析.md](系统流程分析.md)，再看 [系统架构详解.md](系统架构详解.md)
 - 想直接改网络架构图或画跨场景估计模块: 看 [Bi_Layout_网络架构图_可编辑.md](Bi_Layout_网络架构图_可编辑.md)
+- 想确认跨场景共享开口融合的模块输入输出: 看 [跨场景共享开口融合网络架构_可编辑.md](跨场景共享开口融合网络架构_可编辑.md)
+- 想汇报 ZInD 跨场景小实验: 看 [跨场景共享开口融合实验汇报PPT.md](跨场景共享开口融合实验汇报PPT.md)
 - 想包装几何置信度选择项目、填实验数据和准备面试: 看 [几何置信度选择项目模板与面试分析.md](几何置信度选择项目模板与面试分析.md)
 - 想快速复现实验或展示项目主页: 看 [README_几何置信度选择.md](README_几何置信度选择.md)
 
@@ -53,8 +63,10 @@
 - [evaluation/accuracy.py](evaluation/accuracy.py): 评估指标
 - [tools/export_geometry_selector_dataset.py](tools/export_geometry_selector_dataset.py): 导出正式几何 selector 数据集
 - [tools/train_geometry_selector.py](tools/train_geometry_selector.py): 训练和评估几何置信度 selector
+- [tools/estimate_cross_scene_layout.py](tools/estimate_cross_scene_layout.py): 自动估计双房间跨场景共享开口候选
+- [tools/join_room_layouts.py](tools/join_room_layouts.py): 使用共享开口/接口合并两个房间布局
 
 ## 保持原则
 
 - 这里只做导航，不重复正文内容。
-- 具体解释、图示、公式和代码示例都放在三份正文文档里。
+- 具体解释、图示、公式和代码示例都放在对应正文文档里。

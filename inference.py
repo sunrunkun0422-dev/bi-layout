@@ -159,9 +159,16 @@ def show_alpha_floorplan(dt_xyz, side_l=512, border_color=None):
     return dt_floorplan
 
 
-def save_pred_json(xyz, ration, save_path):
+def _to_json_list(value):
+    array = np.asarray(value, dtype=np.float64)
+    return array.tolist()
+
+
+def save_pred_json(xyz, ration, save_path, model_outputs=None):
     # xyz[..., -1] = -xyz[..., -1]
     json_data = xyz2json(xyz, ration)
+    if model_outputs is not None:
+        json_data["biLayoutOutputs"] = model_outputs
     with open(save_path, 'w') as f:
         f.write(json.dumps(json_data, indent=4) + '\n')
     return json_data
@@ -196,7 +203,7 @@ def inference_dataset(dataset):
 
 
 @torch.no_grad()
-def run_one_inference(img, model, args, name, logger, show=True, show_depth=True,
+def run_one_inference(img, model, args, name, logger, show=False, show_depth=True,
                       show_floorplan=True, mesh_format='.obj', mesh_resolution=1024):
     model.eval()
     dt = model(torch.from_numpy(img.transpose(2, 0, 1)[None]).to(args.device))
@@ -210,7 +217,18 @@ def run_one_inference(img, model, args, name, logger, show=True, show_depth=True
                  save_path=os.path.join(args.output_dir, f"{name}_pred.png"))
     output_xyz = dt['processed_xyz'][0] if 'processed_xyz' in dt else depth2xyz(tensor2np(dt['depth'][0]))
 
+    model_outputs = {
+        "depth": _to_json_list(tensor2np(dt["depth"][0])),
+        "ratio": float(tensor2np(dt["ratio"][0])[0]),
+        "postProcessing": args.post_processing,
+    }
+    if "new_depth" in dt:
+        model_outputs["new_depth"] = _to_json_list(tensor2np(dt["new_depth"][0]))
+    if "corner_heat_map" in dt:
+        model_outputs["corner_heat_map"] = _to_json_list(tensor2np(dt["corner_heat_map"][0]))
+
     json_data = save_pred_json(output_xyz, tensor2np(dt['ratio'][0])[0],
+                               model_outputs=model_outputs,
                                save_path=os.path.join(args.output_dir, f"{name}_pred.json"))
     # if args.visualize_3d:
     #     from visualization.visualizer.visualizer import visualize_3d

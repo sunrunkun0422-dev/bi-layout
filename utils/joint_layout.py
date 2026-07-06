@@ -1,9 +1,9 @@
 """
-Shared-door alignment for two independently predicted room layouts.
+Shared-opening alignment for two independently predicted room layouts.
 
 The layout network currently predicts one polygon per panorama. This module
-keeps that model unchanged and aligns two polygons through a doorway observed
-from both rooms.
+keeps that model unchanged and aligns two polygons through a passable wall
+opening observed from both rooms.
 """
 from dataclasses import asdict, dataclass
 from html import escape
@@ -14,6 +14,8 @@ import numpy as np
 
 @dataclass(frozen=True)
 class DoorSpec:
+    """Legacy name for a shared opening/interface segment on a layout wall."""
+
     wall_index: int
     start_ratio: float
     end_ratio: float
@@ -22,7 +24,7 @@ class DoorSpec:
         if self.wall_index < 0:
             raise ValueError("wall_index must be non-negative")
         if not 0 <= self.start_ratio < self.end_ratio <= 1:
-            raise ValueError("door ratios must satisfy 0 <= start < end <= 1")
+            raise ValueError("opening ratios must satisfy 0 <= start < end <= 1")
 
     @classmethod
     def parse(cls, value: str) -> "DoorSpec":
@@ -31,7 +33,7 @@ class DoorSpec:
             return cls(int(wall_index), float(start_ratio), float(end_ratio))
         except (TypeError, ValueError) as exc:
             raise ValueError(
-                "door spec must use wall_index:start_ratio:end_ratio, for example 1:0.25:0.55"
+                "opening spec must use wall_index:start_ratio:end_ratio, for example 1:0.25:0.55"
             ) from exc
 
 
@@ -75,7 +77,7 @@ def door_endpoints(layout: Dict, spec: DoorSpec) -> np.ndarray:
     wall_start = points[start_index]
     wall_vector = points[end_index] - wall_start
     if np.linalg.norm(wall_vector) < 1e-8:
-        raise ValueError("door wall must have non-zero length")
+        raise ValueError("opening wall must have non-zero length")
     return np.asarray([
         wall_start + spec.start_ratio * wall_vector,
         wall_start + spec.end_ratio * wall_vector,
@@ -97,7 +99,7 @@ def _fit_similarity(source: np.ndarray, target: np.ndarray, calibrate_scale: boo
     source_width = np.linalg.norm(source_vector)
     target_width = np.linalg.norm(target_vector)
     if source_width < 1e-8 or target_width < 1e-8:
-        raise ValueError("shared door must have non-zero width in both rooms")
+        raise ValueError("shared opening must have non-zero width in both rooms")
 
     scale = target_width / source_width if calibrate_scale else 1.0
     source_angle = np.arctan2(source_vector[1], source_vector[0])
@@ -170,12 +172,26 @@ def build_joint_layout(layout_a: Dict, layout_b: Dict, door_a: DoorSpec, door_b:
             "side_product": side_a * side_b,
         })
 
-    # The shared wall is an interior interface, so the room centroids should be
-    # on opposite sides of the doorway after alignment.
+    # The shared opening is an interior interface, so the room centroids should
+    # be on opposite sides of it after alignment.
     best = min(candidates, key=lambda candidate: candidate["side_product"])
     camera_center_a = np.zeros(2, dtype=np.float64)
     camera_center_b = _transform_points(np.zeros((1, 2), dtype=np.float64), best["matrix"])[0]
-    shared_door = endpoints_a
+    shared_opening = endpoints_a
+    shared_opening_output = {
+        "roomA": {
+            "spec": asdict(door_a),
+            "localEndpoints": endpoints_a.tolist(),
+            "worldEndpoints": endpoints_a.tolist(),
+        },
+        "roomB": {
+            "spec": asdict(door_b),
+            "localEndpoints": endpoints_b.tolist(),
+            "worldEndpoints": best["endpoints_b"].tolist(),
+        },
+        "worldEndpoints": shared_opening.tolist(),
+        "width": float(np.linalg.norm(shared_opening[1] - shared_opening[0])),
+    }
 
     return {
         "formatVersion": 1,
@@ -184,25 +200,14 @@ def build_joint_layout(layout_a: Dict, layout_b: Dict, door_a: DoorSpec, door_b:
             _room_output("A", layout_a, points_a, camera_center_a),
             _room_output("B", layout_b, best["points_b"], camera_center_b),
         ],
-        "sharedDoor": {
-            "roomA": {
-                "spec": asdict(door_a),
-                "localEndpoints": endpoints_a.tolist(),
-                "worldEndpoints": endpoints_a.tolist(),
-            },
-            "roomB": {
-                "spec": asdict(door_b),
-                "localEndpoints": endpoints_b.tolist(),
-                "worldEndpoints": best["endpoints_b"].tolist(),
-            },
-            "worldEndpoints": shared_door.tolist(),
-            "width": float(np.linalg.norm(shared_door[1] - shared_door[0])),
-        },
+        "sharedOpening": shared_opening_output,
+        "sharedDoor": shared_opening_output,
         "alignment": {
             "roomBToWorld": best["matrix"].tolist(),
             "roomBScale": best["scale"],
             "endpointMapping": best["mapping"],
             "centroidSideProduct": float(best["side_product"]),
+            "scaleCalibratedFromSharedOpening": calibrate_scale,
             "scaleCalibratedFromSharedDoor": calibrate_scale,
         },
     }
@@ -211,7 +216,8 @@ def build_joint_layout(layout_a: Dict, layout_b: Dict, door_a: DoorSpec, door_b:
 def _joint_boundary_projector(joint_layout: Dict, side_length: int, padding: int):
     rooms = joint_layout["rooms"]
     room_points = [np.asarray(room["boundary"], dtype=np.float64) for room in rooms]
-    door = np.asarray(joint_layout["sharedDoor"]["worldEndpoints"], dtype=np.float64)
+    shared = joint_layout.get("sharedOpening", joint_layout["sharedDoor"])
+    door = np.asarray(shared["worldEndpoints"], dtype=np.float64)
     all_points = np.concatenate(room_points + [door], axis=0)
 
     minimum = all_points.min(axis=0)
@@ -264,7 +270,7 @@ def render_joint_boundary_svg(joint_layout: Dict, save_path: str, side_length: i
     door_midpoint = door_pixels.mean(axis=0).astype(np.int32)
     svg.append(
         f'<text x="{door_midpoint[0]}" y="{door_midpoint[1]}" fill="#dc1e1e" '
-        f'font-size="20">shared door</text>'
+        f'font-size="20">shared opening</text>'
     )
     svg.append("</svg>")
     with open(save_path, "w") as file:
@@ -296,6 +302,6 @@ def render_joint_boundary(joint_layout: Dict, save_path: str, side_length: int =
 
     door_pixels = to_pixel(door)
     cv2.line(canvas, tuple(door_pixels[0]), tuple(door_pixels[1]), (30, 30, 220), 8, cv2.LINE_AA)
-    cv2.putText(canvas, "shared door", tuple(door_pixels.mean(axis=0).astype(np.int32)),
+    cv2.putText(canvas, "shared opening", tuple(door_pixels.mean(axis=0).astype(np.int32)),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (30, 30, 220), 2, cv2.LINE_AA)
     cv2.imwrite(save_path, canvas)
