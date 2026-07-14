@@ -1,3 +1,5 @@
+> 修改记录：2026-07-13 16:32 CST - 跨场景入口由旧版更新为统一工程管线。
+
 # Bi-Layout 文档总索引
 
 这是一页式入口。当前项目主线收敛到 Bi-Layout 基础模型与跨场景共享开口融合网络架构。
@@ -25,7 +27,7 @@
 - 想知道原始 Bi-Layout 如何训练、测试和组织数据: 看 [README.md](README.md)
 - 想直接改 Bi-Layout 网络架构图: 看 [Bi_Layout_网络架构图_可编辑.md](Bi_Layout_网络架构图_可编辑.md)
 - 想确认跨场景共享开口融合的模块输入输出: 看 [跨场景共享开口融合网络架构_可编辑.md](跨场景共享开口融合网络架构_可编辑.md)
-- 想运行当前跨场景 MVP: 看 [tools/estimate_cross_scene_layout.py](tools/estimate_cross_scene_layout.py) 和 [tools/join_room_layouts.py](tools/join_room_layouts.py)
+- 想运行跨场景工程版: 看 [tools/estimate_cross_scene_layout.py](tools/estimate_cross_scene_layout.py)、[utils/cross_scene_pipeline.py](utils/cross_scene_pipeline.py) 和 [tools/join_room_layouts.py](tools/join_room_layouts.py)
 
 ## 关键代码位置
 
@@ -36,6 +38,8 @@
 - [postprocessing/post_process.py](postprocessing/post_process.py): 后处理
 - [evaluation/accuracy.py](evaluation/accuracy.py): 评估指标
 - [tools/estimate_cross_scene_layout.py](tools/estimate_cross_scene_layout.py): 自动估计双房间跨场景共享开口候选
+- [utils/cross_scene_pipeline.py](utils/cross_scene_pipeline.py): 统一验证、候选融合、NMS、选择和版本化输出
+- [models/cross_scene_matcher.py](models/cross_scene_matcher.py): 开口响应与双向 cross attention 匹配
 - [tools/join_room_layouts.py](tools/join_room_layouts.py): 使用共享开口/接口合并两个房间布局
 
 ## 保持原则

@@ -132,7 +132,7 @@ class Bi_Layout(BaseModule):
         return output    
 
 
-    def forward(self, x):
+    def forward(self, x, return_features=False):
         """
         :param x: [b, 3(d), 512(h), 1024(w)]
         :return: {
@@ -147,6 +147,7 @@ class Bi_Layout(BaseModule):
 
         # transformer decoder
         x = x.permute(0, 2, 1)  # [b 256(patch_num) 1024(d)]
+        layout_feature = x
         # position encoding
         pos = self.feature_pos(x) # [b 256(patch_num) 1024(d)]
 
@@ -169,6 +170,12 @@ class Bi_Layout(BaseModule):
             corner_heat_map = corner_heat_map.view(-1, self.patch_num)
             corner_heat_map = torch.sigmoid(corner_heat_map)
             output['corner_heat_map'] = corner_heat_map
+
+        if return_features:
+            output['layout_feature'] = layout_feature
+            output['feature_pos'] = pos
+            output['enc_feature'] = x
+            output['ext_feature'] = new_x
 
         return output
 
