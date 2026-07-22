@@ -112,7 +112,10 @@ def parse_option() -> argparse.Namespace:
         "--confidence_temperature",
         type=float,
         default=1.0,
-        help="temperature used to calibrate candidate confidence.",
+        help=(
+            "temperature used to normalize relative candidate scores; the output "
+            "is not a calibrated probability."
+        ),
     )
     parser.add_argument(
         "--allow_invalid_polygon",

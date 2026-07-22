@@ -6,6 +6,8 @@ from utils.cross_scene_estimator import (
     OpeningCandidate,
     estimate_wall_pair_candidates,
     extract_opening_candidates,
+    opening_candidates_from_intervals,
+    wall_token_assignment,
 )
 
 
@@ -36,6 +38,35 @@ def make_layout(points, depth=None, new_depth=None):
 
 
 class CrossSceneEstimatorTest(unittest.TestCase):
+    def test_learned_intervals_keep_matcher_candidate_order(self):
+        layout = make_layout([[-2, -2], [2, -2], [2, 2], [-2, 2]])
+        wall_ids, _ = wall_token_assignment(layout, sample_count=256)
+        token_wall_1 = int(np.flatnonzero(wall_ids == 1)[len(np.flatnonzero(wall_ids == 1)) // 2])
+        token_wall_3 = int(np.flatnonzero(wall_ids == 3)[len(np.flatnonzero(wall_ids == 3)) // 2])
+        intervals = [(token_wall_3, token_wall_3), (token_wall_1, token_wall_1)]
+        probabilities = np.full(256, 0.05, dtype=float)
+        probabilities[token_wall_3] = 0.9
+        probabilities[token_wall_1] = 0.7
+
+        candidates = opening_candidates_from_intervals(
+            layout,
+            intervals,
+            probabilities,
+        )
+
+        self.assertEqual([item.candidate_index for item in candidates], [0, 1])
+        self.assertEqual([item.wall_index for item in candidates], [3, 1])
+        self.assertEqual(
+            [(item.token_start, item.token_end) for item in candidates],
+            intervals,
+        )
+        self.assertAlmostEqual(candidates[0].confidence, 0.9)
+        self.assertEqual(candidates[0].to_json()["candidateIndex"], 0)
+        self.assertEqual(
+            candidates[0].to_json()["confidenceType"],
+            "learned_opening_probability_mean",
+        )
+
     def test_extracts_openings_from_extended_minus_enclosed_depth(self):
         depth = np.ones(256, dtype=float)
         new_depth = depth.copy()
@@ -57,6 +88,12 @@ class CrossSceneEstimatorTest(unittest.TestCase):
         self.assertGreaterEqual(len(candidates), 1)
         self.assertEqual(candidates[0].source, "extended_minus_enclosed")
         self.assertGreater(candidates[0].confidence, 0.5)
+        candidate_json = candidates[0].to_json()
+        self.assertEqual(
+            candidate_json["confidenceType"],
+            "heuristic_normalized_depth_contrast",
+        )
+        self.assertFalse(candidate_json["isCalibratedProbability"])
 
     def test_passability_confidence_changes_wall_pair_ranking(self):
         layout_a = make_layout([[-2, -2], [2, -2], [2, 2], [-2, 2]])

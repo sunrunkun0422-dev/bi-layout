@@ -30,6 +30,8 @@ class ZindNewDataset(BaseDataset):
 
         # Preprocess zind data
         pano_list = read_zind_subset(root_dir, layout_type=data_type, simplicity=simplicity, primary=primary, mode=mode)
+        if for_test_index is not None:
+            pano_list = pano_list[:for_test_index]
         if mode == 'train' or mode == 'val':   # invalid labels will make the training process fail
             self.data = invalid_filter(pano_list=pano_list, mode=mode, logger=logger, patch_num=patch_num)  # a data list contains suitable pano label for training
         else:

@@ -82,6 +82,25 @@ class JointLayoutTest(unittest.TestCase):
         self.assertIn("A:0", svg)
         self.assertIn("B:0", svg)
 
+    def test_can_hide_wall_indices_for_report_visualization(self):
+        layout = make_layout([[-2, -2], [2, -2], [2, 2], [-2, 2]])
+        result = build_joint_layout(
+            layout,
+            layout,
+            DoorSpec(1, 0.25, 0.75),
+            DoorSpec(3, 0.25, 0.75),
+        )
+        with TemporaryDirectory() as output_dir:
+            output_path = f"{output_dir}/boundaries.svg"
+            render_joint_boundary_svg(
+                result, output_path, show_wall_indices=False
+            )
+            with open(output_path, "r") as file:
+                svg = file.read()
+        self.assertIn("shared opening", svg)
+        self.assertNotIn("A:0", svg)
+        self.assertNotIn("B:0", svg)
+
 
 if __name__ == "__main__":
     unittest.main()

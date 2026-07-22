@@ -235,7 +235,13 @@ def _joint_boundary_projector(joint_layout: Dict, side_length: int, padding: int
     return rooms, room_points, door, to_pixel
 
 
-def render_joint_boundary_svg(joint_layout: Dict, save_path: str, side_length: int = 900, padding: int = 70) -> None:
+def render_joint_boundary_svg(
+    joint_layout: Dict,
+    save_path: str,
+    side_length: int = 900,
+    padding: int = 70,
+    show_wall_indices: bool = True,
+) -> None:
     rooms, room_points, door, to_pixel = _joint_boundary_projector(joint_layout, side_length, padding)
     colors = ["#1e6ecd", "#289128"]
     svg = [
@@ -252,13 +258,14 @@ def render_joint_boundary_svg(joint_layout: Dict, save_path: str, side_length: i
             f'<text x="{room_center[0]}" y="{room_center[1]}" fill="{color}" '
             f'font-size="24">Room {escape(str(room["id"]))}</text>'
         )
-        for wall_index, wall_start in enumerate(pixels):
-            wall_end = pixels[(wall_index + 1) % len(pixels)]
-            wall_midpoint = (wall_start + wall_end) // 2
-            svg.append(
-                f'<text x="{wall_midpoint[0]}" y="{wall_midpoint[1]}" fill="{color}" '
-                f'font-size="18">{escape(str(room["id"]))}:{wall_index}</text>'
-            )
+        if show_wall_indices:
+            for wall_index, wall_start in enumerate(pixels):
+                wall_end = pixels[(wall_index + 1) % len(pixels)]
+                wall_midpoint = (wall_start + wall_end) // 2
+                svg.append(
+                    f'<text x="{wall_midpoint[0]}" y="{wall_midpoint[1]}" fill="{color}" '
+                    f'font-size="18">{escape(str(room["id"]))}:{wall_index}</text>'
+                )
         camera = to_pixel(np.asarray([room["cameraCenter"]], dtype=np.float64))[0]
         svg.append(f'<circle cx="{camera[0]}" cy="{camera[1]}" r="7" fill="{color}"/>')
 
@@ -277,7 +284,13 @@ def render_joint_boundary_svg(joint_layout: Dict, save_path: str, side_length: i
         file.write("\n".join(svg) + "\n")
 
 
-def render_joint_boundary(joint_layout: Dict, save_path: str, side_length: int = 900, padding: int = 70) -> None:
+def render_joint_boundary(
+    joint_layout: Dict,
+    save_path: str,
+    side_length: int = 900,
+    padding: int = 70,
+    show_wall_indices: bool = True,
+) -> None:
     try:
         import cv2
     except ImportError as exc:
@@ -292,11 +305,12 @@ def render_joint_boundary(joint_layout: Dict, save_path: str, side_length: int =
         label_at = tuple(to_pixel(np.asarray([points.mean(axis=0)]))[0])
         cv2.putText(canvas, f"Room {room['id']}", label_at, cv2.FONT_HERSHEY_SIMPLEX,
                     0.8, color, 2, cv2.LINE_AA)
-        for wall_index, wall_start in enumerate(pixels):
-            wall_end = pixels[(wall_index + 1) % len(pixels)]
-            wall_midpoint = tuple(((wall_start + wall_end) // 2).tolist())
-            cv2.putText(canvas, f"{room['id']}:{wall_index}", wall_midpoint,
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
+        if show_wall_indices:
+            for wall_index, wall_start in enumerate(pixels):
+                wall_end = pixels[(wall_index + 1) % len(pixels)]
+                wall_midpoint = tuple(((wall_start + wall_end) // 2).tolist())
+                cv2.putText(canvas, f"{room['id']}:{wall_index}", wall_midpoint,
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
         camera = to_pixel(np.asarray([room["cameraCenter"]], dtype=np.float64))[0]
         cv2.drawMarker(canvas, tuple(camera), color, cv2.MARKER_CROSS, 18, 3)
 
