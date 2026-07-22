@@ -33,6 +33,7 @@ class OpeningCandidate:
     token_start: int = -1
     token_end: int = -1
     source: str = "wall_center_fallback"
+    candidate_index: int = -1
     metrics: Optional[Dict[str, float]] = None
 
     def __post_init__(self):
@@ -42,19 +43,32 @@ class OpeningCandidate:
             raise ValueError("opening ratios must satisfy 0 <= start < end <= 1")
         if not 0 <= self.confidence <= 1:
             raise ValueError("opening confidence must be in [0, 1]")
+        if self.candidate_index < -1:
+            raise ValueError("candidate_index must be -1 or non-negative")
 
     @property
     def spec(self) -> DoorSpec:
         return DoorSpec(self.wall_index, self.start_ratio, self.end_ratio)
 
     def to_json(self) -> Dict:
+        if self.source == "learned_opening_probability":
+            confidence_type = "learned_opening_probability_mean"
+        elif self.source == "extended_minus_enclosed":
+            confidence_type = "heuristic_normalized_depth_contrast"
+        elif "fallback" in self.source:
+            confidence_type = "fallback_prior_score"
+        else:
+            confidence_type = "input_score"
         return {
             "wallIndex": self.wall_index,
             "startRatio": self.start_ratio,
             "endRatio": self.end_ratio,
             "confidence": self.confidence,
+            "confidenceType": confidence_type,
+            "isCalibratedProbability": False,
             "tokenStart": self.token_start,
             "tokenEnd": self.token_end,
+            "candidateIndex": self.candidate_index,
             "source": self.source,
             "metrics": self.metrics or {},
         }
@@ -77,10 +91,17 @@ class WallPairCandidate:
     def to_json(self) -> Dict:
         opening_a = asdict(self.door_a)
         opening_b = asdict(self.door_b)
+        confidence_type = (
+            "learned_selector_softmax"
+            if "selectorProbability" in self.metrics
+            else "heuristic_score_softmax"
+        )
         return {
             "rank": self.rank,
             "score": self.score,
             "confidence": self.confidence,
+            "confidenceType": confidence_type,
+            "isCalibratedProbability": False,
             "wallA": self.wall_a,
             "wallB": self.wall_b,
             "openingA": opening_a,
@@ -491,6 +512,128 @@ def extract_opening_candidates(
         "maxHeat": float(np.max(heat_norm)),
         "meanPositiveRelativeDelta": float(np.mean(positive)) if len(positive) else 0.0,
     }
+
+
+def _opening_interval_endpoints(interval: Any) -> Tuple[int, int]:
+    """Read an inclusive token interval without depending on matcher classes."""
+    if hasattr(interval, "token_start") and hasattr(interval, "token_end"):
+        return int(interval.token_start), int(interval.token_end)
+    if isinstance(interval, Mapping):
+        start = interval.get("token_start", interval.get("tokenStart", -1))
+        end = interval.get("token_end", interval.get("tokenEnd", -1))
+        return int(start), int(end)
+    try:
+        if len(interval) != 2:
+            raise ValueError
+        return int(interval[0]), int(interval[1])
+    except (TypeError, ValueError, IndexError) as exc:
+        raise ValueError(
+            "each opening interval must contain token_start and token_end"
+        ) from exc
+
+
+def _opening_probability_array(probabilities: Any) -> np.ndarray:
+    """Convert CPU/GPU tensors and array-like probabilities to a checked vector."""
+    value = probabilities
+    if hasattr(value, "detach"):
+        value = value.detach()
+    if hasattr(value, "cpu"):
+        value = value.cpu()
+    if hasattr(value, "numpy"):
+        value = value.numpy()
+    try:
+        array = np.asarray(value, dtype=np.float64).reshape(-1)
+    except Exception as exc:
+        raise ValueError("probabilities must be a one-dimensional numeric vector") from exc
+    if len(array) == 0:
+        raise ValueError("probabilities must contain at least one token")
+    if not np.isfinite(array).all():
+        raise ValueError("probabilities must contain only finite values")
+    if float(array.min()) < -1e-6 or float(array.max()) > 1.0 + 1e-6:
+        raise ValueError("probabilities must be in [0, 1]")
+    return np.clip(array, 0.0, 1.0)
+
+
+def opening_candidates_from_intervals(
+    layout: Dict,
+    intervals: Iterable,
+    probabilities: Any,
+) -> List[OpeningCandidate]:
+    """Map learned token intervals to geometry candidates without reordering.
+
+    The matcher pools candidates in ``intervals`` order.  Geometry must retain
+    exactly that order so candidate-pair matrix index ``[i, j]`` still refers
+    to geometry openings ``i`` and ``j``.  An interval crossing a layout corner
+    is represented by its dominant wall instead of being split into multiple
+    candidates; consequently every matcher interval produces exactly one
+    :class:`OpeningCandidate`.
+    """
+    probability = _opening_probability_array(probabilities)
+    sample_count = int(len(probability))
+    wall_ids, wall_ratios = wall_token_assignment(
+        layout,
+        sample_count=sample_count,
+    )
+    candidates: List[OpeningCandidate] = []
+
+    for candidate_index, interval in enumerate(list(intervals)):
+        raw_start, raw_end = _opening_interval_endpoints(interval)
+        if raw_start < 0 or raw_end < 0:
+            raise ValueError("opening interval endpoints must be non-negative")
+        start = raw_start % sample_count
+        end = raw_end % sample_count
+        tokens = _tokens_in_segment(start, end, sample_count)
+        if len(tokens) == 0:  # Defensive: inclusive circular intervals are never empty.
+            raise ValueError("opening interval must contain at least one token")
+
+        interval_wall_ids = wall_ids[tokens]
+        unique_walls, counts = np.unique(interval_wall_ids, return_counts=True)
+        # Majority token count is the primary criterion.  Probability mass
+        # deterministically breaks corner ties, followed by the lower wall id.
+        wall_scores = []
+        for wall_index, count in zip(unique_walls.tolist(), counts.tolist()):
+            wall_tokens = tokens[interval_wall_ids == wall_index]
+            probability_mass = float(probability[wall_tokens].sum())
+            wall_scores.append((int(count), probability_mass, -int(wall_index)))
+        dominant_offset = max(range(len(wall_scores)), key=wall_scores.__getitem__)
+        dominant_wall = int(unique_walls[dominant_offset])
+        dominant_tokens = tokens[interval_wall_ids == dominant_wall]
+
+        ratios = wall_ratios[dominant_tokens]
+        wall_token_count = max(1, int(np.count_nonzero(wall_ids == dominant_wall)))
+        ratio_padding = max(0.002, 0.5 / wall_token_count)
+        start_ratio = max(0.0, float(np.min(ratios)) - ratio_padding)
+        end_ratio = min(1.0, float(np.max(ratios)) + ratio_padding)
+        if end_ratio - start_ratio < 1e-3:
+            center = (start_ratio + end_ratio) / 2.0
+            start_ratio = max(0.0, center - 0.01)
+            end_ratio = min(1.0, center + 0.01)
+        if end_ratio - start_ratio < 1e-3:
+            raise ValueError(
+                f"opening interval {candidate_index} maps to a degenerate wall segment"
+            )
+
+        interval_probability = probability[tokens]
+        candidates.append(OpeningCandidate(
+            wall_index=dominant_wall,
+            start_ratio=start_ratio,
+            end_ratio=end_ratio,
+            confidence=float(interval_probability.mean()),
+            token_start=start,
+            token_end=end,
+            source="learned_opening_probability",
+            candidate_index=candidate_index,
+            metrics={
+                "candidateIndex": int(candidate_index),
+                "tokenCount": int(len(tokens)),
+                "dominantWallTokenCount": int(len(dominant_tokens)),
+                "dominantWallFraction": float(len(dominant_tokens) / len(tokens)),
+                "meanProbability": float(interval_probability.mean()),
+                "maxProbability": float(interval_probability.max()),
+            },
+        ))
+
+    return candidates
 
 
 def polygon_area(points: np.ndarray) -> float:
@@ -972,6 +1115,8 @@ def estimate_wall_pair_candidates(
             "rank": 1,
             "score": candidates[0].score,
             "confidence": candidates[0].confidence,
+            "confidenceType": "heuristic_score_softmax",
+            "isCalibratedProbability": False,
             "wallA": candidates[0].wall_a,
             "wallB": candidates[0].wall_b,
             "metrics": candidates[0].metrics,

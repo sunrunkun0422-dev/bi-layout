@@ -25,6 +25,8 @@ from models.bi_layout import Bi_Layout
 from models.cross_scene_matcher import (
     OpeningGuidedCrossAttentionMatcher,
     candidate_intervals_to_mask,
+    opening_probabilities_to_intervals,
+    resolve_enclosed_extended_depth,
 )
 from models.geometry_consistency_selector import (
     GeometryConsistencySelector,
@@ -35,6 +37,7 @@ from utils.conversion import depth2xyz
 from utils.cross_scene_estimator import (
     estimate_wall_pair_candidates,
     extract_opening_candidates,
+    opening_candidates_from_intervals,
     polygon_validity,
 )
 from utils.cross_scene_pipeline import (
@@ -42,6 +45,12 @@ from utils.cross_scene_pipeline import (
     CrossScenePipelineConfig,
     atomic_write_json,
 )
+from utils.opening_checkpoint import (
+    DEFAULT_OPENING_PROBABILITY_THRESHOLD,
+    load_opening_head_checkpoint,
+    resolve_opening_probability_threshold,
+)
+from utils.matcher_checkpoint import load_cross_scene_matcher_checkpoint
 from utils.writer import xyz2json
 
 
@@ -60,10 +69,43 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image_b", default=str(DEFAULT_IMAGE_B))
     parser.add_argument("--config", default=str(DEFAULT_CONFIG))
     parser.add_argument("--checkpoint", default=str(DEFAULT_CHECKPOINT))
+    parser.add_argument(
+        "--matcher_checkpoint",
+        help="optional trained OpeningGuidedCrossAttentionMatcher checkpoint",
+    )
+    parser.add_argument(
+        "--opening_checkpoint",
+        help=(
+            "optional trained OpeningSignalHead checkpoint; loaded after "
+            "--matcher_checkpoint and therefore overrides its opening head"
+        ),
+    )
+    parser.add_argument(
+        "--selector_checkpoint",
+        help="optional trained GeometryConsistencySelector checkpoint",
+    )
     parser.add_argument("--output_dir", default="src/output/cross_scene_format_smoke")
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--top_k", type=int, default=4)
     parser.add_argument("--torch_threads", type=int, default=4)
+    parser.add_argument(
+        "--opening_probability_threshold",
+        type=float,
+        default=None,
+        help=(
+            "explicit opening candidate threshold; otherwise use the value saved "
+            "by --opening_checkpoint, then --matcher_checkpoint, or the legacy "
+            "0.12 default"
+        ),
+    )
+    parser.add_argument(
+        "--branch_order",
+        choices=("extended_first", "enclosed_first"),
+        default="extended_first",
+        help="semantic order of the two Bi-Layout depth branches",
+    )
+    parser.add_argument("--min_opening_width_tokens", type=int, default=2)
+    parser.add_argument("--max_openings_per_view", type=int, default=12)
     parser.add_argument(
         "--random_bi_layout",
         action="store_true",
@@ -188,20 +230,60 @@ def load_bi_layout(
     return model, checkpoint_report
 
 
-def _top_intervals(probability: torch.Tensor, count: int = 4, radius: int = 4):
-    values = probability.detach().cpu().reshape(-1)
-    token_count = len(values)
-    selected = []
-    suppressed = torch.zeros(token_count, dtype=torch.bool)
-    for _ in range(min(count, token_count)):
-        score = values.masked_fill(suppressed, -1.0)
-        center = int(score.argmax().item())
-        if float(score[center]) < 0:
-            break
-        selected.append(((center - radius) % token_count, (center + radius) % token_count))
-        offsets = torch.arange(-2 * radius, 2 * radius + 1)
-        suppressed[(center + offsets) % token_count] = True
-    return selected
+def load_module_checkpoint(
+    module: torch.nn.Module,
+    checkpoint_path: str,
+    state_keys: Sequence[str],
+) -> Dict[str, Any]:
+    """Load one neural submodule without treating random weights as trained."""
+    path = Path(checkpoint_path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    payload = torch.load(str(path), map_location="cpu")
+    state_dict = payload
+    if isinstance(payload, Mapping):
+        for key in state_keys:
+            if isinstance(payload.get(key), Mapping):
+                state_dict = payload[key]
+                break
+        else:
+            state_dict = payload.get("state_dict", payload)
+    if not isinstance(state_dict, Mapping):
+        raise ValueError("checkpoint does not contain a state dictionary")
+    module.load_state_dict(state_dict, strict=True)
+    return {"path": str(path), "loaded": True}
+
+
+def _top_intervals(
+    probability: torch.Tensor,
+    count: int = 12,
+    threshold: float = 0.12,
+    min_width_tokens: int = 2,
+    ensure_non_empty: bool = True,
+):
+    """Extract circular components with a learned-score fallback for inference.
+
+    A validation threshold can legitimately produce no component for one view.
+    Geometry still needs at least one hypothesis to complete the pipeline, so
+    inference falls back to a minimum-width interval around the largest learned
+    probability.  This remains a ``P_open`` candidate; it never invokes the
+    independent depth-contrast extractor.
+    """
+    intervals = opening_probabilities_to_intervals(
+        probability,
+        threshold=threshold,
+        min_width_tokens=min_width_tokens,
+        max_intervals=count,
+    )
+    if intervals or not ensure_non_empty:
+        return intervals
+    values = probability.detach().reshape(-1)
+    token_count = int(values.numel())
+    width = min(int(min_width_tokens), token_count)
+    peak = int(values.argmax().item())
+    start = (peak - (width - 1) // 2) % token_count
+    end = (start + width - 1) % token_count
+    return [(start, end)]
 
 
 def _convex_layout(depth: np.ndarray, ratio: float) -> Dict[str, Any]:
@@ -247,16 +329,29 @@ def candidate_formats(candidates: Sequence[Any]) -> Dict[str, Any]:
 
 def main() -> int:
     args = parse_args()
+    if (
+        args.opening_probability_threshold is not None
+        and not 0.0 <= args.opening_probability_threshold <= 1.0
+    ):
+        raise ValueError("opening_probability_threshold must be in [0, 1]")
+    if min(args.min_opening_width_tokens, args.max_openings_per_view) <= 0:
+        raise ValueError("opening candidate width/count must be positive")
     if args.top_k <= 0 or args.torch_threads <= 0:
         raise ValueError("top_k and torch_threads must be positive")
     image_a = Path(args.image_a).expanduser().resolve()
     image_b = Path(args.image_b).expanduser().resolve()
     checkpoint_path = Path(args.checkpoint).expanduser().resolve()
-    for path in (image_a, image_b, Path(args.config).expanduser().resolve()):
+    config_path = Path(args.config).expanduser().resolve()
+    for path in (image_a, image_b, config_path):
         if not path.is_file():
             raise FileNotFoundError(path)
     if not args.random_bi_layout and not checkpoint_path.is_file():
         raise FileNotFoundError(checkpoint_path)
+    if args.opening_checkpoint and args.random_bi_layout:
+        raise ValueError(
+            "--opening_checkpoint cannot be used with --random_bi_layout because "
+            "its weights require the frozen trained backbone"
+        )
 
     torch.set_num_threads(args.torch_threads)
     device = torch.device(args.device)
@@ -311,32 +406,88 @@ def main() -> int:
         "Bi-Layout checkpoint loaded={}.".format(checkpoint_report["loaded"]),
     )
 
-    matcher = OpeningGuidedCrossAttentionMatcher(feature_dim=model.patch_dim).to(device).eval()
+    matcher_report = {"path": None, "loaded": False}
+    if args.matcher_checkpoint:
+        matcher, matcher_report = load_cross_scene_matcher_checkpoint(
+            args.matcher_checkpoint,
+            expected_feature_dim=int(model.patch_dim),
+            expected_token_count=int(model.patch_num),
+            expected_branch_order=args.branch_order,
+            bi_layout_config_path=str(config_path),
+            bi_layout_checkpoint_path=str(checkpoint_path),
+            device=device,
+        )
+    else:
+        matcher = OpeningGuidedCrossAttentionMatcher(
+            feature_dim=model.patch_dim
+        ).to(device)
+    opening_report = {"path": None, "loaded": False}
+    if args.opening_checkpoint:
+        opening_report = load_opening_head_checkpoint(
+            matcher.opening_head,
+            args.opening_checkpoint,
+            expected_feature_dim=int(model.patch_dim),
+            expected_branch_order=args.branch_order,
+            expected_token_count=int(model.patch_num),
+            bi_layout_config_path=str(config_path),
+            bi_layout_checkpoint_path=str(checkpoint_path),
+        )
+        opening_report["loadOrder"] = (
+            "matcher_checkpoint_then_opening_override"
+            if matcher_report["loaded"]
+            else "opening_checkpoint_only"
+        )
+    opening_threshold = resolve_opening_probability_threshold(
+        args.opening_probability_threshold,
+        opening_report,
+        matcher_report,
+        fallback=DEFAULT_OPENING_PROBABILITY_THRESHOLD,
+    )
+    matcher.eval()
+    enclosed_depth_a, extended_depth_a = resolve_enclosed_extended_depth(
+        layout_output_a, args.branch_order
+    )
+    enclosed_depth_b, extended_depth_b = resolve_enclosed_extended_depth(
+        layout_output_b, args.branch_order
+    )
     with torch.no_grad():
         first_matches = matcher(
             layout_output_a["layout_feature"],
             layout_output_b["layout_feature"],
-            layout_output_a["depth"],
-            layout_output_a["new_depth"],
-            layout_output_b["depth"],
-            layout_output_b["new_depth"],
+            enclosed_depth_a,
+            extended_depth_a,
+            enclosed_depth_b,
+            extended_depth_b,
         )
     reporter.add(
         "M3",
         "开口响应与外延深度",
         {
             "features_A": layout_output_a["layout_feature"],
-            "D_A_enc": layout_output_a["depth"],
-            "D_A_ext": layout_output_a["new_depth"],
+            "D_A_enc": enclosed_depth_a,
+            "D_A_ext": extended_depth_a,
             "features_B": layout_output_b["layout_feature"],
-            "D_B_enc": layout_output_b["depth"],
-            "D_B_ext": layout_output_b["new_depth"],
+            "D_B_enc": enclosed_depth_b,
+            "D_B_ext": extended_depth_b,
         },
         {
             key: first_matches[key]
             for key in ("P_A_open", "P_B_open", "G_A_open", "G_B_open", "Delta_A", "Delta_B")
         },
-        "Opening head is currently initialized but has no dedicated trained checkpoint.",
+        (
+            "Opening checkpoint loaded explicitly after the matcher checkpoint."
+            if opening_report["loaded"] and matcher_report["loaded"]
+            else (
+                "Trained Opening Head checkpoint loaded; the remaining matcher "
+                "weights are still untrained."
+                if opening_report["loaded"]
+                else (
+                    "Opening head came from the full matcher checkpoint."
+                    if matcher_report["loaded"]
+                    else "Opening head is untrained and is used for interface diagnostics only."
+                )
+            )
+        ),
     )
     reporter.add(
         "M4",
@@ -354,7 +505,7 @@ def main() -> int:
     )
     reporter.add(
         "M5",
-        "循环位移与相对 yaw",
+        "共享开口环形 token 位移",
         first_matches["Aff_AB"],
         {
             key: first_matches[key]
@@ -362,30 +513,65 @@ def main() -> int:
                 "cyclic_shift_mass",
                 "cyclic_shift_score",
                 "best_cyclic_shift",
-                "relative_yaw_radians",
+                "relative_token_shift_radians",
             )
         },
     )
 
-    intervals_a = _top_intervals(first_matches["P_A_open"][0])
-    intervals_b = _top_intervals(first_matches["P_B_open"][0])
+    intervals_a = _top_intervals(
+        first_matches["P_A_open"][0],
+        count=args.max_openings_per_view,
+        threshold=opening_threshold["value"],
+        min_width_tokens=args.min_opening_width_tokens,
+        ensure_non_empty=False,
+    )
+    intervals_b = _top_intervals(
+        first_matches["P_B_open"][0],
+        count=args.max_openings_per_view,
+        threshold=opening_threshold["value"],
+        min_width_tokens=args.min_opening_width_tokens,
+        ensure_non_empty=False,
+    )
+    probability_peak_fallback_a = not intervals_a
+    probability_peak_fallback_b = not intervals_b
+    if probability_peak_fallback_a:
+        intervals_a = _top_intervals(
+            first_matches["P_A_open"][0],
+            count=args.max_openings_per_view,
+            threshold=opening_threshold["value"],
+            min_width_tokens=args.min_opening_width_tokens,
+        )
+    if probability_peak_fallback_b:
+        intervals_b = _top_intervals(
+            first_matches["P_B_open"][0],
+            count=args.max_openings_per_view,
+            threshold=opening_threshold["value"],
+            min_width_tokens=args.min_opening_width_tokens,
+        )
     masks_a = candidate_intervals_to_mask(intervals_a, model.patch_num, device=device)
     masks_b = candidate_intervals_to_mask(intervals_b, model.patch_num, device=device)
     with torch.no_grad():
         matches = matcher(
             layout_output_a["layout_feature"],
             layout_output_b["layout_feature"],
-            layout_output_a["depth"],
-            layout_output_a["new_depth"],
-            layout_output_b["depth"],
-            layout_output_b["new_depth"],
+            enclosed_depth_a,
+            extended_depth_a,
+            enclosed_depth_b,
+            extended_depth_b,
             candidate_masks_a=masks_a,
             candidate_masks_b=masks_b,
         )
     reporter.add(
         "M6",
         "开口 Token 池化与候选配对",
-        {"intervals_A": intervals_a, "intervals_B": intervals_b, "masks_A": masks_a, "masks_B": masks_b},
+        {
+            "intervals_A": intervals_a,
+            "intervals_B": intervals_b,
+            "probabilityPeakFallback_A": probability_peak_fallback_a,
+            "probabilityPeakFallback_B": probability_peak_fallback_b,
+            "masks_A": masks_a,
+            "masks_B": masks_b,
+        },
         {
             key: matches[key]
             for key in (
@@ -400,32 +586,63 @@ def main() -> int:
     )
 
     layout_a, layout_report_a = prediction_to_layout(
-        layout_output_a["depth"], layout_output_a["ratio"]
+        enclosed_depth_a, layout_output_a["ratio"]
     )
     layout_b, layout_report_b = prediction_to_layout(
-        layout_output_b["depth"], layout_output_b["ratio"]
+        enclosed_depth_b, layout_output_b["ratio"]
     )
-    extended_a, extended_report_a = prediction_to_layout(
-        layout_output_a["new_depth"], layout_output_a["ratio"]
+    extended_layout_a, extended_report_a = prediction_to_layout(
+        extended_depth_a, layout_output_a["ratio"]
     )
-    extended_b, extended_report_b = prediction_to_layout(
-        layout_output_b["new_depth"], layout_output_b["ratio"]
+    extended_layout_b, extended_report_b = prediction_to_layout(
+        extended_depth_b, layout_output_b["ratio"]
     )
-    openings_a, opening_summary_a = extract_opening_candidates(layout_a, extended_a)
-    openings_b, opening_summary_b = extract_opening_candidates(layout_b, extended_b)
+    learned_opening_weights_loaded = bool(
+        opening_report["loaded"] or matcher_report["loaded"]
+    )
+    if learned_opening_weights_loaded:
+        openings_a = opening_candidates_from_intervals(
+            layout_a,
+            intervals_a,
+            first_matches["P_A_open"][0],
+        )
+        openings_b = opening_candidates_from_intervals(
+            layout_b,
+            intervals_b,
+            first_matches["P_B_open"][0],
+        )
+        opening_summary_a = {
+            "source": "learned_opening_probability",
+            "candidateCount": len(openings_a),
+            "preservedCandidateOrder": True,
+            "probabilityPeakFallback": probability_peak_fallback_a,
+        }
+        opening_summary_b = {
+            "source": "learned_opening_probability",
+            "candidateCount": len(openings_b),
+            "preservedCandidateOrder": True,
+            "probabilityPeakFallback": probability_peak_fallback_b,
+        }
+    else:
+        openings_a, opening_summary_a = extract_opening_candidates(
+            layout_a, extended_layout_a
+        )
+        openings_b, opening_summary_b = extract_opening_candidates(
+            layout_b, extended_layout_b
+        )
     candidates, best_joint = estimate_wall_pair_candidates(
         layout_a,
         layout_b,
         top_k=args.top_k,
         openings_a=openings_a,
         openings_b=openings_b,
-        match_evidence=matches,
+        match_evidence=matches if matcher_report["loaded"] else None,
     )
     geometry_output = {
         "layout_A": layout_a,
         "layout_B": layout_b,
-        "extended_layout_A": extended_a,
-        "extended_layout_B": extended_b,
+        "extended_layout_A": extended_layout_a,
+        "extended_layout_B": extended_layout_b,
         "opening_summary_A": opening_summary_a,
         "opening_summary_B": opening_summary_b,
         "openings_A": [opening.to_json() for opening in openings_a],
@@ -441,15 +658,25 @@ def main() -> int:
             "new_depth_A": layout_output_a["new_depth"],
             "depth_B": layout_output_b["depth"],
             "new_depth_B": layout_output_b["new_depth"],
-            "match_evidence": matches,
+            "match_evidence": matches if matcher_report["loaded"] else None,
         },
         geometry_output,
-        "Layout post-processing A/B: {}/{}.".format(
-            layout_report_a["postProcessing"], layout_report_b["postProcessing"]
+        "Layout post-processing A/B: {}/{}; opening source: {}.".format(
+            layout_report_a["postProcessing"],
+            layout_report_b["postProcessing"],
+            opening_summary_a["source"],
         ),
     )
 
-    selector = GeometryConsistencySelector().to(device).eval()
+    selector = GeometryConsistencySelector().to(device)
+    selector_report = {"path": None, "loaded": False}
+    if args.selector_checkpoint:
+        selector_report = load_module_checkpoint(
+            selector,
+            args.selector_checkpoint,
+            ("selector", "selector_state_dict"),
+        )
+    selector.eval()
     metric_tensor = candidate_metrics_to_tensor(
         [candidate.metrics for candidate in candidates], device=device
     )
@@ -460,18 +687,28 @@ def main() -> int:
         "几何一致性选择头",
         metric_tensor,
         selector_output,
-        "Selector is randomly initialized because no selector checkpoint exists yet.",
+        (
+            "Selector checkpoint loaded."
+            if selector_report["loaded"]
+            else "Selector is untrained and is used for interface diagnostics only."
+        ),
     )
 
     pipeline = CrossScenePipeline(
-        CrossScenePipelineConfig(top_k=args.top_k), selector=selector
+        CrossScenePipelineConfig(
+            top_k=args.top_k,
+            feature_weight=1.0 if matcher_report["loaded"] else 0.0,
+        ),
+        selector=selector if selector_report["loaded"] else None,
     )
     pipeline_result = pipeline.run(
         layout_a,
         layout_b,
-        extended_layout_a=extended_a,
-        extended_layout_b=extended_b,
-        match_evidence=matches,
+        extended_layout_a=extended_layout_a,
+        extended_layout_b=extended_layout_b,
+        match_evidence=matches if matcher_report["loaded"] else None,
+        openings_a=openings_a,
+        openings_b=openings_b,
     )
     final_payload = {
         "candidateReport": pipeline_result.candidates_json(
@@ -489,9 +726,9 @@ def main() -> int:
         {
             "layout_A": layout_a,
             "layout_B": layout_b,
-            "extended_layout_A": extended_a,
-            "extended_layout_B": extended_b,
-            "match_evidence": matches,
+            "extended_layout_A": extended_layout_a,
+            "extended_layout_B": extended_layout_b,
+            "match_evidence": matches if matcher_report["loaded"] else None,
         },
         final_payload,
         "Wrote {} and {}.".format(candidates_path.name, joint_path.name),
@@ -505,9 +742,18 @@ def main() -> int:
         "checkpoint": checkpoint_report,
         "neuralModuleWeights": {
             "biLayout": "trained checkpoint" if checkpoint_report["loaded"] else "random",
-            "openingCrossAttention": "random initialization",
-            "geometrySelector": "random initialization",
+            "openingCrossAttention": matcher_report,
+            "crossAttentionMatcher": matcher_report,
+            "openingHead": opening_report,
+            "geometrySelector": selector_report,
         },
+        "openingCandidateThreshold": opening_threshold,
+        "openingCandidateSource": opening_summary_a["source"],
+        "openingCandidateFallback": {
+            "A": learned_opening_weights_loaded and probability_peak_fallback_a,
+            "B": learned_opening_weights_loaded and probability_peak_fallback_b,
+        },
+        "depthBranchOrder": args.branch_order,
         "layoutConversion": {
             "A": layout_report_a,
             "B": layout_report_b,

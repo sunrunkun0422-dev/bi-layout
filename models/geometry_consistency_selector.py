@@ -38,7 +38,7 @@ def candidate_metrics_to_tensor(
 
 
 class GeometryConsistencySelector(nn.Module):
-    """Predict a calibrated distribution over geometry candidates."""
+    """Predict a learned relative distribution over geometry candidates."""
 
     def __init__(self, input_dim: int = len(GEOMETRY_METRIC_NAMES), hidden_dim: int = 64,
                  dropout: float = 0.1):

@@ -47,6 +47,80 @@ def candidate_intervals_to_mask(
     return masks
 
 
+def opening_probabilities_to_intervals(
+    probability: torch.Tensor,
+    threshold: float = 0.12,
+    min_width_tokens: int = 2,
+    max_intervals: int = 12,
+) -> list:
+    """Extract confidence-ranked circular components from a 1D opening score.
+
+    Unlike fixed-radius top-k peaks, this preserves the predicted opening
+    width and merges a component that crosses the panorama seam.  The default
+    threshold is calibrated on the ZInD-BiPair-v1 validation split for the
+    untrained geometry prior; callers using a trained opening head should pass
+    their own validation threshold.
+    """
+    values = probability.detach().reshape(-1)
+    token_count = int(values.numel())
+    if token_count <= 0:
+        raise ValueError("probability must contain at least one token")
+    if not torch.isfinite(values).all():
+        raise ValueError("probability must contain only finite values")
+    if not math.isfinite(float(threshold)):
+        raise ValueError("threshold must be finite")
+    if min_width_tokens <= 0 or max_intervals <= 0:
+        raise ValueError("min_width_tokens and max_intervals must be positive")
+
+    mask = values >= float(threshold)
+    if not bool(mask.any()):
+        return []
+    if bool(mask.all()):
+        return [(0, token_count - 1)] if token_count >= min_width_tokens else []
+
+    starts = torch.where(mask & ~torch.roll(mask, shifts=1))[0].tolist()
+    ranked = []
+    for start in starts:
+        end = int(start)
+        tokens = [int(start)]
+        while bool(mask[(end + 1) % token_count]):
+            end = (end + 1) % token_count
+            tokens.append(end)
+        if len(tokens) < int(min_width_tokens):
+            continue
+        index = torch.as_tensor(tokens, device=values.device, dtype=torch.long)
+        component_score = float(values[index].mean().item())
+        ranked.append((component_score, len(tokens), int(start), int(end)))
+
+    ranked.sort(key=lambda item: (-item[0], -item[1], item[2]))
+    return [(start, end) for _, _, start, end in ranked[:max_intervals]]
+
+
+def resolve_enclosed_extended_depth(
+    output: Mapping[str, torch.Tensor],
+    branch_order: str = "extended_first",
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Map Bi-Layout's two depth branches to explicit geometry semantics.
+
+    The ZInD two-head checkpoint is trained with ``depth=layout_visible`` and
+    ``new_depth=layout_raw``.  In the opening pipeline those tensors mean
+    ``extended`` and ``enclosed`` respectively.  Keeping this mapping explicit
+    prevents the positive opening contrast from being accidentally reversed.
+
+    ``enclosed_first`` remains available for checkpoints trained with the
+    opposite label order.
+    """
+    if "depth" not in output or "new_depth" not in output:
+        raise ValueError("Bi-Layout output must contain depth and new_depth")
+    if branch_order == "extended_first":
+        return output["new_depth"], output["depth"]
+    if branch_order == "enclosed_first":
+        return output["depth"], output["new_depth"]
+    raise ValueError(
+        "branch_order must be 'extended_first' or 'enclosed_first'"
+    )
+
+
 class OpeningSignalHead(nn.Module):
     """Predict per-token opening response and usable expansion depth."""
 
@@ -127,6 +201,55 @@ class OpeningSignalHead(nn.Module):
         }
 
 
+def opening_detection_loss(
+    opening_logits: torch.Tensor,
+    opening_target: torch.Tensor,
+    pos_weight: float = 2.5,
+    tversky_weight: float = 0.5,
+    tversky_alpha: float = 0.3,
+    tversky_beta: float = 0.7,
+    eps: float = 1e-6,
+) -> Dict[str, torch.Tensor]:
+    """Recall-oriented supervised loss for the single-view Opening Head."""
+    if opening_logits.ndim != 2:
+        raise ValueError("opening_logits must have shape [B, N]")
+    if opening_target.shape != opening_logits.shape:
+        raise ValueError("opening_target must match opening_logits")
+    if pos_weight <= 0 or tversky_weight < 0:
+        raise ValueError("pos_weight must be positive and tversky_weight non-negative")
+    if min(tversky_alpha, tversky_beta, eps) <= 0:
+        raise ValueError("Tversky alpha, beta, and eps must be positive")
+
+    target = opening_target.to(
+        device=opening_logits.device,
+        dtype=opening_logits.dtype,
+    )
+    positive_weight = opening_logits.new_tensor(float(pos_weight))
+    bce = F.binary_cross_entropy_with_logits(
+        opening_logits,
+        target,
+        pos_weight=positive_weight,
+    )
+    probability = torch.sigmoid(opening_logits)
+    reduce_dims = tuple(range(1, opening_logits.ndim))
+    true_positive = (probability * target).sum(dim=reduce_dims)
+    false_positive = (probability * (1.0 - target)).sum(dim=reduce_dims)
+    false_negative = ((1.0 - probability) * target).sum(dim=reduce_dims)
+    tversky_index = (true_positive + eps) / (
+        true_positive
+        + float(tversky_alpha) * false_positive
+        + float(tversky_beta) * false_negative
+        + eps
+    )
+    tversky = (1.0 - tversky_index).mean()
+    total = bce + float(tversky_weight) * tversky
+    return {
+        "loss_total": total,
+        "loss_bce": bce,
+        "loss_tversky": tversky,
+    }
+
+
 class OpeningTokenPooler(nn.Module):
     """Pool token features inside each candidate opening interval."""
 
@@ -168,6 +291,7 @@ class OpeningGuidedCrossAttentionMatcher(nn.Module):
         opening_bias_strength: float = 1.0,
         candidate_temperature: float = 0.2,
         shift_temperature: float = 0.05,
+        dustbin_score: float = 0.0,
     ):
         super().__init__()
         if feature_dim % heads != 0:
@@ -201,22 +325,102 @@ class OpeningGuidedCrossAttentionMatcher(nn.Module):
             nn.Dropout(dropout),
         )
         self.pooler = OpeningTokenPooler()
+        # A learned score for assigning an opening candidate to ``no match``.
+        # Keeping it in the matcher (instead of using a fixed threshold) lets
+        # negative pairs directly supervise rejection.
+        self.dustbin_score = nn.Parameter(torch.tensor(float(dustbin_score)))
 
     def _split_heads(self, value: torch.Tensor) -> torch.Tensor:
         batch, tokens, _ = value.shape
         return value.view(batch, tokens, self.heads, self.head_dim).transpose(1, 2)
 
     @staticmethod
-    def _token_mask(candidate_masks: Optional[torch.Tensor], reference: torch.Tensor):
+    def _prepare_candidate_valid(
+        candidate_valid: Optional[torch.Tensor],
+        candidate_masks: torch.Tensor,
+        batch_size: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Return a batch-shaped validity mask and reject ambiguous padding."""
+        mask_valid = candidate_masks.to(device=device, dtype=torch.bool).any(dim=-1)
+        if candidate_valid is None:
+            return mask_valid
+        if candidate_valid.ndim == 1:
+            candidate_valid = candidate_valid.unsqueeze(0)
+        if candidate_valid.ndim != 2:
+            raise ValueError("candidate_valid must have shape [B, K] or [K]")
+        if candidate_valid.shape[0] == 1 and batch_size > 1:
+            candidate_valid = candidate_valid.expand(batch_size, -1)
+        if candidate_valid.shape != mask_valid.shape:
+            raise ValueError("candidate_valid shape must match candidate_masks [B, K]")
+        return mask_valid & candidate_valid.to(device=device, dtype=torch.bool)
+
+    @classmethod
+    def _token_mask(
+        cls,
+        candidate_masks: Optional[torch.Tensor],
+        reference: torch.Tensor,
+        candidate_valid: Optional[torch.Tensor] = None,
+    ):
         if candidate_masks is None:
             return None
         if candidate_masks.ndim == 2:
             candidate_masks = candidate_masks.unsqueeze(0)
         if candidate_masks.shape[0] == 1 and reference.shape[0] > 1:
             candidate_masks = candidate_masks.expand(reference.shape[0], -1, -1)
-        mask = candidate_masks.to(device=reference.device, dtype=torch.bool).any(dim=1)
+        if candidate_masks.ndim != 3:
+            raise ValueError("candidate_masks must have shape [B, K, N] or [K, N]")
+        if candidate_masks.shape[0] != reference.shape[0]:
+            raise ValueError("candidate mask batch size does not match features")
+        if candidate_masks.shape[-1] != reference.shape[1]:
+            raise ValueError("candidate mask token count does not match features")
+        valid = cls._prepare_candidate_valid(
+            candidate_valid,
+            candidate_masks,
+            reference.shape[0],
+            reference.device,
+        )
+        mask = (
+            candidate_masks.to(device=reference.device, dtype=torch.bool)
+            & valid.unsqueeze(-1)
+        ).any(dim=1)
         has_opening = mask.any(dim=-1, keepdim=True)
         return torch.where(has_opening, mask, torch.ones_like(mask))
+
+    @staticmethod
+    def _opening_guidance(
+        prediction: torch.Tensor,
+        external: Optional[torch.Tensor],
+        mode: str,
+        mix_weight: float,
+    ) -> torch.Tensor:
+        """Select the signal used by matching without replacing head outputs."""
+        if mode not in ("predicted", "gt", "mix"):
+            raise ValueError(
+                "opening_guidance_mode must be 'predicted', 'gt', or 'mix'"
+            )
+        if not 0.0 <= float(mix_weight) <= 1.0:
+            raise ValueError("opening_guidance_mix_weight must be in [0, 1]")
+        if mode == "predicted":
+            return prediction
+        if external is None:
+            raise ValueError(
+                "external opening guidance is required for 'gt' and 'mix' modes"
+            )
+        if external.ndim == 1:
+            external = external.unsqueeze(0)
+        if external.shape[0] == 1 and prediction.shape[0] > 1:
+            external = external.expand(prediction.shape[0], -1)
+        if external.shape != prediction.shape:
+            raise ValueError("opening guidance must match prediction shape [B, N]")
+        external = external.to(device=prediction.device, dtype=prediction.dtype)
+        if not torch.isfinite(external).all():
+            raise ValueError("opening guidance must contain only finite values")
+        external = external.clamp(0.0, 1.0)
+        if mode == "gt":
+            return external
+        weight = float(mix_weight)
+        return (1.0 - weight) * prediction + weight * external
 
     def _attend(
         self,
@@ -262,6 +466,10 @@ class OpeningGuidedCrossAttentionMatcher(nn.Module):
             "cyclic_shift_mass": shift_mass,
             "cyclic_shift_score": shift_probability,
             "best_cyclic_shift": best_shift,
+            # Canonical meaning: horizontal B-token minus A-token shift.  This
+            # is not generally the camera relative yaw when camera centers
+            # differ.  Keep the historical key below as a compatibility alias.
+            "relative_token_shift_radians": yaw,
             "relative_yaw_radians": yaw,
         }
 
@@ -273,6 +481,8 @@ class OpeningGuidedCrossAttentionMatcher(nn.Module):
         opening_b: torch.Tensor,
         candidate_masks_a: torch.Tensor,
         candidate_masks_b: torch.Tensor,
+        candidate_valid_a: Optional[torch.Tensor] = None,
+        candidate_valid_b: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         if candidate_masks_a.ndim == 2:
             candidate_masks_a = candidate_masks_a.unsqueeze(0)
@@ -285,23 +495,26 @@ class OpeningGuidedCrossAttentionMatcher(nn.Module):
         candidate_masks_a = candidate_masks_a.to(device=features_a.device, dtype=torch.bool)
         candidate_masks_b = candidate_masks_b.to(device=features_b.device, dtype=torch.bool)
 
-        pooled_a, weights_a, valid_a = self.pooler(features_a, opening_a, candidate_masks_a)
-        pooled_b, weights_b, valid_b = self.pooler(features_b, opening_b, candidate_masks_b)
+        pooled_a, weights_a, mask_valid_a = self.pooler(
+            features_a, opening_a, candidate_masks_a
+        )
+        pooled_b, weights_b, mask_valid_b = self.pooler(
+            features_b, opening_b, candidate_masks_b
+        )
         batch, count_a, _ = pooled_a.shape
         count_b = pooled_b.shape[1]
-
-        if count_a == 0 or count_b == 0:
-            shape = (batch, count_a, count_b)
-            empty = pooled_a.new_zeros(shape)
-            best = torch.full((batch, 2), -1, dtype=torch.long, device=pooled_a.device)
-            return {
-                "E_A_open": pooled_a,
-                "E_B_open": pooled_b,
-                "candidate_logits": empty,
-                "candidate_affinity": empty,
-                "candidate_pair_score": empty,
-                "best_candidate_pair": best,
-            }
+        valid_a = mask_valid_a & self._prepare_candidate_valid(
+            candidate_valid_a,
+            candidate_masks_a,
+            batch,
+            features_a.device,
+        )
+        valid_b = mask_valid_b & self._prepare_candidate_valid(
+            candidate_valid_b,
+            candidate_masks_b,
+            batch,
+            features_b.device,
+        )
 
         candidate_a = F.normalize(self.query_projection(pooled_a), dim=-1)
         candidate_b = F.normalize(self.key_projection(pooled_b), dim=-1)
@@ -309,10 +522,64 @@ class OpeningGuidedCrossAttentionMatcher(nn.Module):
         logits = logits / self.candidate_temperature
 
         pair_valid = valid_a.unsqueeze(-1) & valid_b.unsqueeze(1)
-        safe_logits = logits.masked_fill(~valid_b.unsqueeze(1), torch.finfo(logits.dtype).min)
-        affinity = torch.softmax(safe_logits, dim=-1)
-        affinity = affinity * pair_valid.to(affinity.dtype)
-        affinity = affinity / affinity.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        neg_inf = torch.finfo(logits.dtype).min
+
+        # The last row/column are dustbins.  Two directional row-softmaxes are
+        # exposed because one matrix cannot simultaneously express all A->B
+        # and B->A rejection probabilities when candidate counts differ.
+        assignment_logits = logits.new_full(
+            (batch, count_a + 1, count_b + 1),
+            neg_inf,
+        )
+        assignment_logits[:, :count_a, :count_b] = logits.masked_fill(
+            ~pair_valid, neg_inf
+        )
+        assignment_logits[:, :count_a, count_b] = torch.where(
+            valid_a,
+            self.dustbin_score.to(logits),
+            logits.new_full((), neg_inf),
+        )
+        assignment_logits[:, count_a, :count_b] = torch.where(
+            valid_b,
+            self.dustbin_score.to(logits),
+            logits.new_full((), neg_inf),
+        )
+        assignment_logits[:, count_a, count_b] = self.dustbin_score.to(logits)
+
+        valid_rows_ab = torch.cat(
+            (valid_a, torch.ones((batch, 1), dtype=torch.bool, device=logits.device)),
+            dim=-1,
+        )
+        assignment_ab = torch.softmax(assignment_logits, dim=-1)
+        assignment_ab = assignment_ab * valid_rows_ab.unsqueeze(-1).to(logits.dtype)
+
+        assignment_ba = torch.softmax(assignment_logits.transpose(-2, -1), dim=-1)
+        valid_rows_ba = torch.cat(
+            (valid_b, torch.ones((batch, 1), dtype=torch.bool, device=logits.device)),
+            dim=-1,
+        )
+        assignment_ba = assignment_ba * valid_rows_ba.unsqueeze(-1).to(logits.dtype)
+
+        affinity_ab = assignment_ab[:, :count_a, :count_b]
+        affinity_ba = assignment_ba[:, :count_b, :count_a]
+        mutual_affinity = torch.sqrt(
+            (affinity_ab * affinity_ba.transpose(-2, -1)).clamp_min(0.0)
+        )
+        no_match_a = assignment_ab[:, :count_a, count_b]
+        no_match_b = assignment_ba[:, :count_b, count_a]
+
+        assignment_probability = assignment_logits.new_zeros(
+            assignment_logits.shape
+        )
+        assignment_probability[:, :count_a, :count_b] = mutual_affinity
+        assignment_probability[:, :count_a, count_b] = no_match_a
+        assignment_probability[:, count_a, :count_b] = no_match_b
+        assignment_probability[:, count_a, count_b] = torch.sqrt(
+            (
+                assignment_ab[:, count_a, count_b]
+                * assignment_ba[:, count_b, count_a]
+            ).clamp_min(0.0)
+        )
 
         mask_a = candidate_masks_a.to(features_a.dtype)
         mask_b = candidate_masks_b.to(features_b.dtype)
@@ -321,23 +588,71 @@ class OpeningGuidedCrossAttentionMatcher(nn.Module):
         confidence_b = (mask_b * opening_b.unsqueeze(1)).sum(-1)
         confidence_b = confidence_b / mask_b.sum(-1).clamp_min(1.0)
         pair_confidence = torch.sqrt(confidence_a.unsqueeze(-1) * confidence_b.unsqueeze(1))
-        pair_score = torch.sigmoid(logits) * pair_confidence * pair_valid.to(logits.dtype)
+        pair_score = mutual_affinity * pair_confidence * pair_valid.to(logits.dtype)
 
-        flat_best = pair_score.flatten(1).argmax(dim=-1)
-        best_a = torch.div(flat_best, count_b, rounding_mode="floor")
-        best = torch.stack((best_a, flat_best.remainder(count_b)), dim=-1)
-        has_pair = pair_valid.flatten(1).any(dim=-1)
-        best = torch.where(has_pair.unsqueeze(-1), best, torch.full_like(best, -1))
+        best = torch.full((batch, 2), -1, dtype=torch.long, device=pooled_a.device)
+        if count_a > 0 and count_b > 0:
+            flat_best = pair_score.flatten(1).argmax(dim=-1)
+            best_a = torch.div(flat_best, count_b, rounding_mode="floor")
+            proposed_best = torch.stack(
+                (best_a, flat_best.remainder(count_b)), dim=-1
+            )
+            chosen_a_to_b = affinity_ab > no_match_a.unsqueeze(-1)
+            chosen_b_to_a = affinity_ba.transpose(-2, -1) > no_match_b.unsqueeze(1)
+            accepted_pair = pair_valid & chosen_a_to_b & chosen_b_to_a
+            has_pair = accepted_pair.flatten(1).any(dim=-1)
+            # Select the best mutually accepted pair, not merely the largest
+            # real-real cell when every candidate prefers its dustbin.
+            accepted_score = pair_score.masked_fill(~accepted_pair, -1.0)
+            accepted_best = accepted_score.flatten(1).argmax(dim=-1)
+            accepted_a = torch.div(accepted_best, count_b, rounding_mode="floor")
+            proposed_best = torch.stack(
+                (accepted_a, accepted_best.remainder(count_b)), dim=-1
+            )
+            best = torch.where(has_pair.unsqueeze(-1), proposed_best, best)
+
+        def valid_mean_or_one(values: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+            count = valid.sum(dim=-1)
+            mean = (values * valid.to(values.dtype)).sum(dim=-1)
+            mean = mean / count.clamp_min(1).to(values.dtype)
+            return torch.where(count > 0, mean, torch.ones_like(mean))
+
+        mean_no_match_a = valid_mean_or_one(no_match_a, valid_a)
+        mean_no_match_b = valid_mean_or_one(no_match_b, valid_b)
+        pair_no_match = torch.sqrt(
+            (mean_no_match_a * mean_no_match_b).clamp_min(0.0)
+        )
+        if count_a > 0 and count_b > 0:
+            pair_match = pair_score.flatten(1).amax(dim=-1)
+        else:
+            pair_match = logits.new_zeros((batch,))
 
         return {
             "E_A_open": pooled_a,
             "E_B_open": pooled_b,
             "candidate_weights_A": weights_a,
             "candidate_weights_B": weights_b,
+            "candidate_masks_A": candidate_masks_a,
+            "candidate_masks_B": candidate_masks_b,
+            "candidate_valid_A": valid_a,
+            "candidate_valid_B": valid_b,
             "candidate_logits": logits,
-            "candidate_affinity": affinity,
+            # Backward-compatible real-candidate view. Rows now sum to <= 1;
+            # the remaining mass is explicitly assigned to the dustbin.
+            "candidate_affinity": affinity_ab,
             "candidate_pair_score": pair_score,
             "best_candidate_pair": best,
+            "candidate_assignment_logits": assignment_logits,
+            "candidate_assignment_AB": assignment_ab,
+            "candidate_assignment_BA": assignment_ba,
+            "candidate_assignment_probability": assignment_probability,
+            "candidate_assignment": assignment_probability,
+            "candidate_no_match_probability_A": no_match_a,
+            "candidate_no_match_probability_B": no_match_b,
+            "no_match_probability_A": no_match_a,
+            "no_match_probability_B": no_match_b,
+            "pair_match_probability": pair_match,
+            "pair_no_match_probability": pair_no_match,
         }
 
     def forward(
@@ -352,6 +667,12 @@ class OpeningGuidedCrossAttentionMatcher(nn.Module):
         position_b: Optional[torch.Tensor] = None,
         candidate_masks_a: Optional[torch.Tensor] = None,
         candidate_masks_b: Optional[torch.Tensor] = None,
+        candidate_valid_a: Optional[torch.Tensor] = None,
+        candidate_valid_b: Optional[torch.Tensor] = None,
+        opening_guidance_a: Optional[torch.Tensor] = None,
+        opening_guidance_b: Optional[torch.Tensor] = None,
+        opening_guidance_mode: str = "predicted",
+        opening_guidance_mix_weight: float = 0.5,
     ) -> Dict[str, torch.Tensor]:
         if features_a.shape != features_b.shape:
             raise ValueError("features_a and features_b must have the same shape")
@@ -360,8 +681,24 @@ class OpeningGuidedCrossAttentionMatcher(nn.Module):
         signal_b = self.opening_head(features_b, enclosed_depth_b, extended_depth_b)
         opening_a = signal_a["opening_probability"]
         opening_b = signal_b["opening_probability"]
-        token_mask_a = self._token_mask(candidate_masks_a, features_a)
-        token_mask_b = self._token_mask(candidate_masks_b, features_b)
+        guidance_a = self._opening_guidance(
+            opening_a,
+            opening_guidance_a,
+            opening_guidance_mode,
+            opening_guidance_mix_weight,
+        )
+        guidance_b = self._opening_guidance(
+            opening_b,
+            opening_guidance_b,
+            opening_guidance_mode,
+            opening_guidance_mix_weight,
+        )
+        token_mask_a = self._token_mask(
+            candidate_masks_a, features_a, candidate_valid_a
+        )
+        token_mask_b = self._token_mask(
+            candidate_masks_b, features_b, candidate_valid_b
+        )
 
         normalized_a = self.input_norm(features_a)
         normalized_b = self.input_norm(features_b)
@@ -375,10 +712,10 @@ class OpeningGuidedCrossAttentionMatcher(nn.Module):
         value_b = self._split_heads(self.value_projection(normalized_b))
 
         context_ab, attention_ab = self._attend(
-            query_a, key_b, value_b, opening_b, token_mask_b
+            query_a, key_b, value_b, guidance_b, token_mask_b
         )
         context_ba, attention_ba = self._attend(
-            query_b, key_a, value_a, opening_a, token_mask_a
+            query_b, key_a, value_a, guidance_a, token_mask_a
         )
         cross_a = features_a + self.dropout(self.output_projection(context_ab))
         cross_b = features_b + self.dropout(self.output_projection(context_ba))
@@ -387,8 +724,8 @@ class OpeningGuidedCrossAttentionMatcher(nn.Module):
 
         affinity_ab = attention_ab.mean(dim=1)
         affinity_ba = attention_ba.mean(dim=1)
-        effective_opening_a = opening_a
-        effective_opening_b = opening_b
+        effective_opening_a = guidance_a
+        effective_opening_b = guidance_b
         if token_mask_a is not None:
             effective_opening_a = effective_opening_a * token_mask_a.to(opening_a.dtype)
         if token_mask_b is not None:
@@ -401,8 +738,14 @@ class OpeningGuidedCrossAttentionMatcher(nn.Module):
         )
 
         result = {
+            "opening_logits_A": signal_a["opening_logits"],
+            "opening_logits_B": signal_b["opening_logits"],
             "P_A_open": opening_a,
             "P_B_open": opening_b,
+            # Guidance is matcher-only. P_A/P_B and opening_logits always
+            # remain the Opening Head predictions and can still be supervised.
+            "opening_guidance_A": guidance_a,
+            "opening_guidance_B": guidance_b,
             "G_A_open": signal_a["expansion_depth"],
             "G_B_open": signal_b["expansion_depth"],
             "Delta_A": signal_a["delta"],
@@ -423,10 +766,12 @@ class OpeningGuidedCrossAttentionMatcher(nn.Module):
             result.update(self._candidate_matches(
                 cross_a,
                 cross_b,
-                opening_a,
-                opening_b,
+                guidance_a,
+                guidance_b,
                 candidate_masks_a,
                 candidate_masks_b,
+                candidate_valid_a,
+                candidate_valid_b,
             ))
         return result
 
@@ -439,6 +784,7 @@ class DualPanoramaCrossAttentionModel(nn.Module):
         bi_layout: nn.Module,
         matcher: Optional[OpeningGuidedCrossAttentionMatcher] = None,
         use_position_encoding: bool = False,
+        depth_branch_order: str = "extended_first",
     ):
         super().__init__()
         self.bi_layout = bi_layout
@@ -446,6 +792,11 @@ class DualPanoramaCrossAttentionModel(nn.Module):
             feature_dim=bi_layout.patch_dim
         )
         self.use_position_encoding = bool(use_position_encoding)
+        if depth_branch_order not in ("extended_first", "enclosed_first"):
+            raise ValueError(
+                "depth_branch_order must be 'extended_first' or 'enclosed_first'"
+            )
+        self.depth_branch_order = depth_branch_order
 
     def forward(
         self,
@@ -453,25 +804,233 @@ class DualPanoramaCrossAttentionModel(nn.Module):
         image_b: torch.Tensor,
         candidate_masks_a: Optional[torch.Tensor] = None,
         candidate_masks_b: Optional[torch.Tensor] = None,
+        candidate_valid_a: Optional[torch.Tensor] = None,
+        candidate_valid_b: Optional[torch.Tensor] = None,
+        opening_guidance_a: Optional[torch.Tensor] = None,
+        opening_guidance_b: Optional[torch.Tensor] = None,
+        opening_guidance_mode: str = "predicted",
+        opening_guidance_mix_weight: float = 0.5,
     ) -> Dict[str, object]:
         output_a = self.bi_layout(image_a, return_features=True)
         output_b = self.bi_layout(image_b, return_features=True)
         if "new_depth" not in output_a or "new_depth" not in output_b:
             raise ValueError("Cross-scene matching requires Bi_Layout output_number=2")
 
+        enclosed_a, extended_a = resolve_enclosed_extended_depth(
+            output_a, self.depth_branch_order
+        )
+        enclosed_b, extended_b = resolve_enclosed_extended_depth(
+            output_b, self.depth_branch_order
+        )
+
         matches = self.matcher(
             output_a["layout_feature"],
             output_b["layout_feature"],
-            output_a["depth"],
-            output_a["new_depth"],
-            output_b["depth"],
-            output_b["new_depth"],
+            enclosed_a,
+            extended_a,
+            enclosed_b,
+            extended_b,
             position_a=output_a["feature_pos"] if self.use_position_encoding else None,
             position_b=output_b["feature_pos"] if self.use_position_encoding else None,
             candidate_masks_a=candidate_masks_a,
             candidate_masks_b=candidate_masks_b,
+            candidate_valid_a=candidate_valid_a,
+            candidate_valid_b=candidate_valid_b,
+            opening_guidance_a=opening_guidance_a,
+            opening_guidance_b=opening_guidance_b,
+            opening_guidance_mode=opening_guidance_mode,
+            opening_guidance_mix_weight=opening_guidance_mix_weight,
         )
         return {"layout_A": output_a, "layout_B": output_b, "matches": matches}
+
+
+def bidirectional_candidate_consistency_loss(
+    outputs: Mapping[str, torch.Tensor],
+    candidate_valid_a: Optional[torch.Tensor] = None,
+    candidate_valid_b: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Penalize disagreement between A->B and B->A real-candidate scores."""
+    assignment_ab = outputs["candidate_assignment_AB"]
+    assignment_ba = outputs["candidate_assignment_BA"]
+    if assignment_ab.ndim != 3 or assignment_ba.ndim != 3:
+        raise ValueError("candidate assignments must have shape [B, K+1, L+1]")
+    batch, count_a_plus_bin, count_b_plus_bin = assignment_ab.shape
+    if assignment_ba.shape != (batch, count_b_plus_bin, count_a_plus_bin):
+        raise ValueError("candidate_assignment_BA must be the reverse-shaped assignment")
+    count_a = count_a_plus_bin - 1
+    count_b = count_b_plus_bin - 1
+
+    if candidate_valid_a is None:
+        candidate_valid_a = outputs.get("candidate_valid_A")
+    if candidate_valid_b is None:
+        candidate_valid_b = outputs.get("candidate_valid_B")
+    if candidate_valid_a is None:
+        candidate_valid_a = torch.ones(
+            (batch, count_a), dtype=torch.bool, device=assignment_ab.device
+        )
+    if candidate_valid_b is None:
+        candidate_valid_b = torch.ones(
+            (batch, count_b), dtype=torch.bool, device=assignment_ab.device
+        )
+    candidate_valid_a = candidate_valid_a.to(
+        device=assignment_ab.device, dtype=torch.bool
+    )
+    candidate_valid_b = candidate_valid_b.to(
+        device=assignment_ab.device, dtype=torch.bool
+    )
+    if candidate_valid_a.shape != (batch, count_a):
+        raise ValueError("candidate_valid_a must have shape [B, K_A]")
+    if candidate_valid_b.shape != (batch, count_b):
+        raise ValueError("candidate_valid_b must have shape [B, K_B]")
+
+    real_ab = assignment_ab[:, :count_a, :count_b]
+    real_ba = assignment_ba[:, :count_b, :count_a].transpose(-2, -1)
+    pair_valid = candidate_valid_a.unsqueeze(-1) & candidate_valid_b.unsqueeze(1)
+    squared_error = (real_ab - real_ba).square()
+    if pair_valid.any():
+        return squared_error[pair_valid].mean()
+    return squared_error.new_zeros(())
+
+
+def candidate_assignment_loss(
+    outputs: Mapping[str, torch.Tensor],
+    candidate_target_ab: Optional[torch.Tensor] = None,
+    target_candidate_pair: Optional[torch.Tensor] = None,
+    is_match: Optional[torch.Tensor] = None,
+    candidate_valid_a: Optional[torch.Tensor] = None,
+    candidate_valid_b: Optional[torch.Tensor] = None,
+    consistency_weight: float = 0.1,
+) -> Dict[str, torch.Tensor]:
+    """Supervise candidate correspondence including explicit no-match bins.
+
+    ``candidate_target_ab`` may contain one or several positive cells per
+    source candidate. Candidates without a positive cell are supervised to
+    their dustbin. For a negative image pair (``is_match=False``), all valid
+    candidates on both sides are supervised to no-match.
+    """
+    if consistency_weight < 0:
+        raise ValueError("consistency_weight must be non-negative")
+    assignment_ab = outputs["candidate_assignment_AB"]
+    assignment_ba = outputs["candidate_assignment_BA"]
+    batch, count_a_plus_bin, count_b_plus_bin = assignment_ab.shape
+    count_a = count_a_plus_bin - 1
+    count_b = count_b_plus_bin - 1
+    if assignment_ba.shape != (batch, count_b_plus_bin, count_a_plus_bin):
+        raise ValueError("candidate_assignment_BA must be the reverse-shaped assignment")
+
+    if candidate_valid_a is None:
+        candidate_valid_a = outputs.get("candidate_valid_A")
+    if candidate_valid_b is None:
+        candidate_valid_b = outputs.get("candidate_valid_B")
+    if candidate_valid_a is None:
+        candidate_valid_a = torch.ones(
+            (batch, count_a), dtype=torch.bool, device=assignment_ab.device
+        )
+    if candidate_valid_b is None:
+        candidate_valid_b = torch.ones(
+            (batch, count_b), dtype=torch.bool, device=assignment_ab.device
+        )
+    candidate_valid_a = candidate_valid_a.to(
+        device=assignment_ab.device, dtype=torch.bool
+    )
+    candidate_valid_b = candidate_valid_b.to(
+        device=assignment_ab.device, dtype=torch.bool
+    )
+    if candidate_valid_a.shape != (batch, count_a):
+        raise ValueError("candidate_valid_a must have shape [B, K_A]")
+    if candidate_valid_b.shape != (batch, count_b):
+        raise ValueError("candidate_valid_b must have shape [B, K_B]")
+
+    if candidate_target_ab is not None and target_candidate_pair is not None:
+        raise ValueError(
+            "provide candidate_target_ab or target_candidate_pair, not both"
+        )
+    if candidate_target_ab is None:
+        candidate_target_ab = assignment_ab.new_zeros((batch, count_a, count_b))
+    else:
+        candidate_target_ab = candidate_target_ab.to(assignment_ab)
+        if candidate_target_ab.shape != (batch, count_a, count_b):
+            raise ValueError("candidate_target_ab must have shape [B, K_A, K_B]")
+        if (candidate_target_ab < 0).any():
+            raise ValueError("candidate_target_ab must be non-negative")
+
+    if target_candidate_pair is not None:
+        target_candidate_pair = torch.as_tensor(
+            target_candidate_pair, device=assignment_ab.device, dtype=torch.long
+        )
+        if target_candidate_pair.ndim == 1:
+            target_candidate_pair = target_candidate_pair.unsqueeze(0)
+        if target_candidate_pair.shape[0] == 1 and batch > 1:
+            target_candidate_pair = target_candidate_pair.expand(batch, -1)
+        if target_candidate_pair.shape != (batch, 2):
+            raise ValueError("target_candidate_pair must have shape [B, 2]")
+        target_from_pair = assignment_ab.new_zeros((batch, count_a, count_b))
+        for batch_index, pair in enumerate(target_candidate_pair.tolist()):
+            index_a, index_b = pair
+            if 0 <= index_a < count_a and 0 <= index_b < count_b:
+                target_from_pair[batch_index, index_a, index_b] = 1.0
+        candidate_target_ab = target_from_pair
+
+    if is_match is None:
+        is_match = candidate_target_ab.flatten(1).sum(dim=-1) > 0
+    else:
+        is_match = torch.as_tensor(is_match, device=assignment_ab.device)
+        if is_match.ndim == 0:
+            is_match = is_match.unsqueeze(0)
+        is_match = is_match.reshape(-1).to(dtype=torch.bool)
+        if is_match.shape[0] == 1 and batch > 1:
+            is_match = is_match.expand(batch)
+        if is_match.shape != (batch,):
+            raise ValueError("is_match must have shape [B]")
+
+    pair_valid = candidate_valid_a.unsqueeze(-1) & candidate_valid_b.unsqueeze(1)
+    candidate_target_ab = candidate_target_ab * pair_valid.to(
+        candidate_target_ab.dtype
+    )
+    candidate_target_ab = candidate_target_ab * is_match[:, None, None].to(
+        candidate_target_ab.dtype
+    )
+    candidate_target_ba = candidate_target_ab.transpose(-2, -1)
+
+    def directional_loss(
+        probability: torch.Tensor,
+        real_target: torch.Tensor,
+        source_valid: torch.Tensor,
+    ) -> torch.Tensor:
+        real_count = real_target.shape[-1]
+        row_mass = real_target.sum(dim=-1, keepdim=True)
+        normalized_real = real_target / row_mass.clamp_min(1e-6)
+        dustbin_target = (row_mass <= 0).to(real_target.dtype)
+        target = torch.cat((normalized_real, dustbin_target), dim=-1)
+        row_loss = -(target * probability[..., :real_count + 1].clamp_min(1e-8).log()).sum(-1)
+        if source_valid.any():
+            return row_loss[source_valid].mean()
+        return row_loss.new_zeros(())
+
+    loss_ab = directional_loss(
+        assignment_ab[:, :count_a, :],
+        candidate_target_ab,
+        candidate_valid_a,
+    )
+    loss_ba = directional_loss(
+        assignment_ba[:, :count_b, :],
+        candidate_target_ba,
+        candidate_valid_b,
+    )
+    assignment_loss = 0.5 * (loss_ab + loss_ba)
+    consistency_loss = bidirectional_candidate_consistency_loss(
+        outputs,
+        candidate_valid_a=candidate_valid_a,
+        candidate_valid_b=candidate_valid_b,
+    )
+    total = assignment_loss + float(consistency_weight) * consistency_loss
+    return {
+        "loss_candidate_total": total,
+        "loss_candidate_assignment": assignment_loss,
+        "loss_candidate_assignment_ab": loss_ab,
+        "loss_candidate_assignment_ba": loss_ba,
+        "loss_bidirectional_consistency": consistency_loss,
+    }
 
 
 def opening_matching_loss(
@@ -483,16 +1042,36 @@ def opening_matching_loss(
     expansion_target_b: Optional[torch.Tensor] = None,
     expansion_weight: float = 1.0,
     affinity_weight: float = 1.0,
+    candidate_target_ab: Optional[torch.Tensor] = None,
+    target_candidate_pair: Optional[torch.Tensor] = None,
+    is_match: Optional[torch.Tensor] = None,
+    candidate_valid_a: Optional[torch.Tensor] = None,
+    candidate_valid_b: Optional[torch.Tensor] = None,
+    candidate_assignment_weight: float = 1.0,
+    consistency_weight: float = 0.1,
 ) -> Dict[str, torch.Tensor]:
     """Compute supervised losses for opening response, depth, and matching."""
     opening_target_a = opening_target_a.to(outputs["P_A_open"])
     opening_target_b = opening_target_b.to(outputs["P_B_open"])
-    opening_loss = F.binary_cross_entropy(outputs["P_A_open"], opening_target_a)
-    opening_loss = opening_loss + F.binary_cross_entropy(outputs["P_B_open"], opening_target_b)
+    if "opening_logits_A" in outputs and "opening_logits_B" in outputs:
+        opening_loss = F.binary_cross_entropy_with_logits(
+            outputs["opening_logits_A"], opening_target_a
+        )
+        opening_loss = opening_loss + F.binary_cross_entropy_with_logits(
+            outputs["opening_logits_B"], opening_target_b
+        )
+    else:
+        opening_loss = F.binary_cross_entropy(outputs["P_A_open"], opening_target_a)
+        opening_loss = opening_loss + F.binary_cross_entropy(
+            outputs["P_B_open"], opening_target_b
+        )
     total = opening_loss
     zero = opening_loss.new_zeros(())
     expansion_loss = zero
     affinity_loss = zero
+    candidate_loss = zero
+    candidate_assignment_component = zero
+    consistency_loss = zero
 
     if expansion_target_a is not None and expansion_target_b is not None:
         expansion_target_a = expansion_target_a.to(outputs["G_A_open"])
@@ -521,29 +1100,92 @@ def opening_matching_loss(
         affinity_loss = affinity_loss_ab + affinity_loss_ba
         total = total + float(affinity_weight) * affinity_loss
 
+    has_candidate_assignment = (
+        "candidate_assignment_AB" in outputs
+        and "candidate_assignment_BA" in outputs
+    )
+    candidate_supervision = (
+        candidate_target_ab is not None
+        or target_candidate_pair is not None
+        or is_match is not None
+        or (affinity_target_ab is not None and "candidate_masks_A" in outputs)
+    )
+    if has_candidate_assignment and candidate_supervision:
+        if (
+            candidate_target_ab is None
+            and target_candidate_pair is None
+            and affinity_target_ab is not None
+            and "candidate_masks_A" in outputs
+            and "candidate_masks_B" in outputs
+        ):
+            masks_a = outputs["candidate_masks_A"].to(
+                device=affinity_target_ab.device,
+                dtype=affinity_target_ab.dtype,
+            )
+            masks_b = outputs["candidate_masks_B"].to(
+                device=affinity_target_ab.device,
+                dtype=affinity_target_ab.dtype,
+            )
+            candidate_target_ab = torch.einsum(
+                "bkn,bnm,blm->bkl",
+                masks_a,
+                affinity_target_ab,
+                masks_b,
+            )
+        candidate_losses = candidate_assignment_loss(
+            outputs,
+            candidate_target_ab=candidate_target_ab,
+            target_candidate_pair=target_candidate_pair,
+            is_match=is_match,
+            candidate_valid_a=candidate_valid_a,
+            candidate_valid_b=candidate_valid_b,
+            consistency_weight=consistency_weight,
+        )
+        candidate_loss = candidate_losses["loss_candidate_total"]
+        candidate_assignment_component = candidate_losses[
+            "loss_candidate_assignment"
+        ]
+        consistency_loss = candidate_losses["loss_bidirectional_consistency"]
+        total = total + float(candidate_assignment_weight) * candidate_loss
+
     return {
         "loss_total": total,
         "loss_opening": opening_loss,
         "loss_expansion": expansion_loss,
         "loss_affinity": affinity_loss,
+        "loss_candidate": candidate_loss,
+        "loss_candidate_assignment": candidate_assignment_component,
+        "loss_bidirectional_consistency": consistency_loss,
     }
+
+
+def cyclic_token_shift_loss(
+    cyclic_shift_score: torch.Tensor,
+    target_shift_radians: torch.Tensor,
+) -> torch.Tensor:
+    """Supervise the circular B-token minus A-token shift in radians."""
+    if cyclic_shift_score.ndim != 2:
+        raise ValueError("cyclic_shift_score must have shape [B, N]")
+    token_count = cyclic_shift_score.shape[-1]
+    target_shift_radians = target_shift_radians.to(cyclic_shift_score).reshape(-1)
+    if target_shift_radians.shape[0] != cyclic_shift_score.shape[0]:
+        raise ValueError("target_shift_radians batch size does not match predictions")
+    target_shift = torch.round(
+        target_shift_radians * token_count / (2.0 * math.pi)
+    ).to(torch.long).remainder(token_count)
+    return F.nll_loss(cyclic_shift_score.clamp_min(1e-8).log(), target_shift)
 
 
 def cyclic_yaw_loss(
     cyclic_shift_score: torch.Tensor,
     target_yaw_radians: torch.Tensor,
 ) -> torch.Tensor:
-    """Supervise circular panorama shift using relative yaw in radians."""
-    if cyclic_shift_score.ndim != 2:
-        raise ValueError("cyclic_shift_score must have shape [B, N]")
-    token_count = cyclic_shift_score.shape[-1]
-    target_yaw_radians = target_yaw_radians.to(cyclic_shift_score).reshape(-1)
-    if target_yaw_radians.shape[0] != cyclic_shift_score.shape[0]:
-        raise ValueError("target_yaw_radians batch size does not match predictions")
-    target_shift = torch.round(
-        target_yaw_radians * token_count / (2.0 * math.pi)
-    ).to(torch.long).remainder(token_count)
-    return F.nll_loss(cyclic_shift_score.clamp_min(1e-8).log(), target_shift)
+    """Compatibility alias for :func:`cyclic_token_shift_loss`.
+
+    The historical name is retained for callers, but the target must be the
+    shared portal's B-token minus A-token shift, not camera relative yaw.
+    """
+    return cyclic_token_shift_loss(cyclic_shift_score, target_yaw_radians)
 
 
 def relative_pose_loss(

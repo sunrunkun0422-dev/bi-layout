@@ -8,16 +8,18 @@ import tempfile
 from copy import deepcopy
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 import numpy as np
 
 from utils.cross_scene_estimator import (
+    OpeningCandidate,
     WallPairCandidate,
     estimate_wall_pair_candidates,
     extract_opening_candidates,
     polygon_validity,
     simplify_layout_for_estimation,
+    wall_count,
 )
 from utils.joint_layout import build_joint_layout
 
@@ -67,6 +69,16 @@ class CrossScenePipelineResult:
         output = {
             "formatVersion": 2,
             "method": self.method,
+            "confidenceSemantics": {
+                "openingCandidate": (
+                    "Learned opening response, heuristic normalized depth-contrast "
+                    "score, or fallback prior; not a calibrated probability."
+                ),
+                "wallPairCandidate": (
+                    "Relative softmax over the retained candidates; not a calibrated "
+                    "probability."
+                ),
+            },
             "config": asdict(self.config),
             "layoutPreparation": self.layout_preparation,
             "passability": self.opening_summary,
@@ -128,6 +140,8 @@ class CrossScenePipeline:
             "rank": 1,
             "score": selected.score,
             "confidence": selected.confidence,
+            "confidenceType": "learned_selector_softmax",
+            "isCalibratedProbability": False,
             "wallA": selected.wall_a,
             "wallB": selected.wall_b,
             "metrics": selected.metrics,
@@ -137,12 +151,28 @@ class CrossScenePipeline:
             selected_joint["diagnostics"] = deepcopy(best_joint_layout["diagnostics"])
         return reranked, selected_joint
 
-    def _prepare_layout(self, layout: Dict, name: str):
-        prepared, simplification = simplify_layout_for_estimation(
-            layout,
-            tolerance=self.config.simplify_tolerance,
-            max_walls=self.config.max_walls,
-        )
+    def _prepare_layout(
+        self,
+        layout: Dict,
+        name: str,
+        preserve_wall_indices: bool = False,
+    ):
+        if preserve_wall_indices:
+            prepared = layout
+            count = wall_count(layout)
+            simplification = {
+                "simplified": False,
+                "originalWallCount": count,
+                "wallCount": count,
+                "tolerance": self.config.simplify_tolerance,
+                "skippedReason": "explicit_opening_wall_indices",
+            }
+        else:
+            prepared, simplification = simplify_layout_for_estimation(
+                layout,
+                tolerance=self.config.simplify_tolerance,
+                max_walls=self.config.max_walls,
+            )
         validity = polygon_validity(prepared)
         if self.config.strict_polygon_validation and not validity["valid"]:
             raise ValueError(f"{name} polygon failed validation: {validity}")
@@ -155,9 +185,22 @@ class CrossScenePipeline:
         extended_layout_a: Optional[Dict] = None,
         extended_layout_b: Optional[Dict] = None,
         match_evidence: Optional[Mapping[str, Any]] = None,
+        openings_a: Optional[Sequence[OpeningCandidate]] = None,
+        openings_b: Optional[Sequence[OpeningCandidate]] = None,
     ) -> CrossScenePipelineResult:
-        prepared_a, preparation_a = self._prepare_layout(layout_a, "layout A")
-        prepared_b, preparation_b = self._prepare_layout(layout_b, "layout B")
+        if (openings_a is None) != (openings_b is None):
+            raise ValueError("openings_a and openings_b must be provided together")
+        explicit_openings = openings_a is not None
+        prepared_a, preparation_a = self._prepare_layout(
+            layout_a,
+            "layout A",
+            preserve_wall_indices=explicit_openings,
+        )
+        prepared_b, preparation_b = self._prepare_layout(
+            layout_b,
+            "layout B",
+            preserve_wall_indices=explicit_openings,
+        )
 
         prepared_ext_a = None
         prepared_ext_b = None
@@ -172,9 +215,58 @@ class CrossScenePipeline:
                 extended_layout_b, "extended layout B"
             )
 
-        openings_a = None
-        openings_b = None
-        if self.config.use_passability:
+        if explicit_openings:
+            openings_a = list(openings_a)
+            openings_b = list(openings_b)
+            if not openings_a or not openings_b:
+                raise RuntimeError(
+                    "explicit opening candidates must be non-empty for both layouts"
+                )
+            for side, openings, prepared in (
+                ("A", openings_a, prepared_a),
+                ("B", openings_b, prepared_b),
+            ):
+                count = wall_count(prepared)
+                for index, opening in enumerate(openings):
+                    if opening.wall_index >= count:
+                        raise ValueError(
+                            f"opening {side}[{index}] references wall "
+                            f"{opening.wall_index}, but the layout has {count} walls"
+                        )
+                    if opening.candidate_index >= 0 and opening.candidate_index != index:
+                        raise ValueError(
+                            f"opening {side}[{index}] has candidate_index "
+                            f"{opening.candidate_index}; explicit openings must preserve order"
+                        )
+            sources_a = {opening.source for opening in openings_a}
+            sources_b = {opening.source for opening in openings_b}
+            summary_a = {
+                "source": (
+                    next(iter(sources_a))
+                    if len(sources_a) == 1
+                    else "mixed_explicit_opening_candidates"
+                ),
+                "candidateCount": len(openings_a),
+                "preservedCandidateOrder": True,
+            }
+            summary_b = {
+                "source": (
+                    next(iter(sources_b))
+                    if len(sources_b) == 1
+                    else "mixed_explicit_opening_candidates"
+                ),
+                "candidateCount": len(openings_b),
+                "preservedCandidateOrder": True,
+            }
+            opening_summary = {
+                "enabled": True,
+                "explicit": True,
+                "A": summary_a,
+                "B": summary_b,
+                "candidatesA": [candidate.to_json() for candidate in openings_a],
+                "candidatesB": [candidate.to_json() for candidate in openings_b],
+            }
+        elif self.config.use_passability:
             openings_a, summary_a = extract_opening_candidates(
                 prepared_a,
                 extended_layout=prepared_ext_a,
@@ -193,14 +285,18 @@ class CrossScenePipeline:
             )
             opening_summary = {
                 "enabled": True,
+                "explicit": False,
                 "A": summary_a,
                 "B": summary_b,
                 "candidatesA": [candidate.to_json() for candidate in openings_a],
                 "candidatesB": [candidate.to_json() for candidate in openings_b],
             }
         else:
+            openings_a = None
+            openings_b = None
             opening_summary = {
                 "enabled": False,
+                "explicit": False,
                 "A": {"source": "disabled_wall_center_fallback"},
                 "B": {"source": "disabled_wall_center_fallback"},
                 "candidatesA": [],
@@ -230,8 +326,14 @@ class CrossScenePipeline:
             candidates, prepared_a, prepared_b, best_joint_layout
         )
 
-        method_parts = ["validated_geometry", "opening_nms", "calibrated_selection"]
-        if self.config.use_passability:
+        method_parts = [
+            "validated_geometry",
+            "opening_nms",
+            "temperature_normalized_selection",
+        ]
+        if explicit_openings:
+            method_parts.insert(0, "explicit_openings")
+        elif self.config.use_passability:
             method_parts.insert(0, "passability")
         if match_evidence:
             method_parts.insert(1, "cross_attention")

@@ -210,6 +210,7 @@ class HorizonNetFeatureExtractor(nn.Module):
         # self.out_scale = 8
         self.out_scale = scale
         self.step_cols = 4
+        self.second = bool(second)
 
         # Encoder
         if backbone.startswith('res'):
@@ -227,7 +228,7 @@ class HorizonNetFeatureExtractor(nn.Module):
 
         # Convert features from 4 blocks of the encoder into B x C x 1 x W'
         self.reduce_height_module = GlobalHeightStage(c1, c2, c3, c4, self.out_scale)
-        if second == True:
+        if self.second:
             self.reduce_height_module2 = GlobalHeightStage(c1, c2, c3, c4, self.out_scale)
         self.x_mean.requires_grad = False
         self.x_std.requires_grad = False
@@ -253,15 +254,21 @@ class HorizonNetFeatureExtractor(nn.Module):
         # 2 [b, 1024(d),  32(h),  64(w)]
         # 3 [b, 2048(d),  16(h),  32(w)]
         x = self.reduce_height_module(conv_list, x.shape[3] // self.step_cols)  # [b 1024(d) 1(h) 256(w)]
-        if second == True:
-            x2 = self.reduce_height_module(conv_list, x_shape3 // self.step_cols)  # [b 1024(d) 1(h) 256(w)]
+        if second:
+            if not self.second:
+                raise ValueError(
+                    "second=True requires HorizonNetFeatureExtractor(second=True)"
+                )
+            x2 = self.reduce_height_module2(
+                conv_list, x_shape3 // self.step_cols
+            )  # [b 1024(d) 1(h) 256(w)]
         # After reduce_Height_module, h becomes 1, the information is compressed to d,
         # and w contains different resolutions
         # 0 [b,  256(d), 128(h), 256(w)] -> [b,  256/8(d) * 128/16(h') = 256(d), 1(h) 256(w)]
         # 1 [b,  512(d),  64(h), 128(w)] -> [b,  512/8(d) *  64/16(h') = 256(d), 1(h) 256(w)]
         # 2 [b, 1024(d),  32(h),  64(w)] -> [b, 1024/8(d) *  32/16(h') = 256(d), 1(h) 256(w)]
         # 3 [b, 2048(d),  16(h),  32(w)] -> [b, 2048/8(d) *  16/16(h') = 256(d), 1(h) 256(w)]
-        if second == True:
+        if second:
             return x, x2
         return x  # [b 1024(d) 1(h) 256(w)]
 

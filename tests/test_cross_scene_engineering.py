@@ -1,6 +1,7 @@
 import json
 import unittest
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -131,6 +132,55 @@ class CrossSceneEngineeringTest(unittest.TestCase):
         self.assertGreater(payload["candidateCount"], 0)
         self.assertTrue(payload["layoutPreparation"]["A"]["validity"]["valid"])
         self.assertIn("selection", result.best_joint_layout)
+        self.assertIn("not a calibrated probability", payload["confidenceSemantics"]["wallPairCandidate"])
+        self.assertFalse(payload["candidates"][0]["isCalibratedProbability"])
+
+    def test_pipeline_uses_explicit_openings_without_reextracting(self):
+        layout = make_layout([[-2, -2], [2, -2], [2, 2], [-2, 2]])
+        openings_a = [
+            OpeningCandidate(
+                1,
+                0.3,
+                0.6,
+                0.9,
+                token_start=20,
+                token_end=30,
+                source="learned_opening_probability",
+                candidate_index=0,
+            )
+        ]
+        openings_b = [
+            OpeningCandidate(
+                3,
+                0.2,
+                0.5,
+                0.8,
+                token_start=120,
+                token_end=132,
+                source="learned_opening_probability",
+                candidate_index=0,
+            )
+        ]
+        pipeline = CrossScenePipeline(CrossScenePipelineConfig(top_k=2))
+
+        with patch(
+            "utils.cross_scene_pipeline.extract_opening_candidates",
+            side_effect=AssertionError("legacy extractor must not be called"),
+        ):
+            result = pipeline.run(
+                layout,
+                layout,
+                openings_a=openings_a,
+                openings_b=openings_b,
+            )
+
+        self.assertTrue(result.opening_summary["explicit"])
+        self.assertEqual(
+            result.opening_summary["candidatesA"][0]["candidateIndex"], 0
+        )
+        self.assertIn("explicit_openings", result.method)
+        self.assertEqual(result.candidates[0].opening_a.candidate_index, 0)
+        self.assertEqual(result.candidates[0].opening_b.candidate_index, 0)
 
     def test_pipeline_can_apply_learned_selector(self):
         layout = make_layout([[-2, -2], [2, -2], [2, 2], [-2, 2]])
@@ -166,6 +216,59 @@ class CrossSceneEngineeringTest(unittest.TestCase):
         self.assertEqual(len(dataset), 1)
         self.assertEqual(batch["image_A"].shape, (1, 3, 8, 16))
         self.assertEqual(batch["pair_id"][0], "a_b")
+
+    def test_pair_dataset_expands_matching_supervision_and_pads_candidates(self):
+        with TemporaryDirectory() as directory:
+            for name, value in (("a.png", 64), ("b.png", 192), ("c.png", 128)):
+                Image.fromarray(
+                    np.full((4, 8, 3), value, dtype=np.uint8)
+                ).save(f"{directory}/{name}")
+            manifest = f"{directory}/matching.json"
+            records = [
+                {
+                    "id": "positive",
+                    "image_a": "a.png",
+                    "image_b": "b.png",
+                    "candidates_a": [{"tokenInterval": [7, 0]}, {"tokenInterval": [2, 3]}],
+                    "candidates_b": [{"tokenInterval": [4, 5]}],
+                    "supervision": {
+                        "is_match": True,
+                        "target_candidate_a": 0,
+                        "target_candidate_b": 0,
+                        "relative_transform_b_to_a": [[1, 0, 2], [0, 1, 3], [0, 0, 1]],
+                        "relative_yaw_radians": 0.0,
+                        "pose_valid": True,
+                    },
+                },
+                {
+                    "id": "negative",
+                    "image_a": "a.png",
+                    "image_b": "c.png",
+                    "candidates_a": [{"tokenInterval": [1, 1]}],
+                    "candidates_b": [{"tokenInterval": [6, 6]}],
+                    "supervision": {
+                        "is_match": False,
+                        "target_candidate_a": -1,
+                        "target_candidate_b": -1,
+                        "pose_valid": False,
+                    },
+                },
+            ]
+            with open(manifest, "w", encoding="utf-8") as file:
+                json.dump({"tokenCount": 8, "pairs": records}, file)
+
+            batch = next(iter(build_pair_dataloader(
+                manifest, batch_size=2, image_shape=(8, 16)
+            )))
+
+        self.assertEqual(batch["candidate_masks_A"].shape, (2, 2, 8))
+        self.assertEqual(batch["candidate_valid_A"].tolist(), [[True, True], [True, False]])
+        self.assertTrue(batch["candidate_masks_A"][0, 0, 7])
+        self.assertTrue(batch["candidate_masks_A"][0, 0, 0])
+        self.assertEqual(batch["affinity_target_AB"][0].sum().item(), 4.0)
+        self.assertEqual(batch["affinity_target_AB"][1].sum().item(), 0.0)
+        self.assertEqual(batch["is_match"].tolist(), [True, False])
+        self.assertEqual(batch["pose_valid"].tolist(), [True, False])
 
     def test_learned_selector_masks_candidates_and_backpropagates(self):
         selector = GeometryConsistencySelector(hidden_dim=16, dropout=0.0)
